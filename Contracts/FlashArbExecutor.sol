@@ -454,11 +454,20 @@ contract FlashArbExecutor is
                     bytes("")
                 );
             }
-        } else {
-            // V2 style: constant‑product (Aerodrome volatile & AlienBase).
-            // Use per‑pool fee if set, otherwise default 30 bps.
-            (uint112 reserve0, uint112 reserve1, ) = IUniswapV2Pair(pool).getReserves();
-            (uint256 reserveIn, uint256 reserveOut) = zeroForOne ? (reserve0, reserve1) : (reserve1, reserve0);
+                } else {
+            // V2 style: constant‑product (Aerodrome volatile & AlienBase)
+            uint256 reserveIn;
+            uint256 reserveOut;
+
+            if (dexType == DexType.AERODROME_V2) {
+                // Aerodrome V2 returns uint256 reserves.
+                (uint256 r0, uint256 r1, ) = IAerodromeV2Pool(pool).getReserves();
+                (reserveIn, reserveOut) = zeroForOne ? (r0, r1) : (r1, r0);
+            } else {
+                // AlienBase V2 (standard Uniswap V2 style)
+                (uint112 r0, uint112 r1, ) = IUniswapV2Pair(pool).getReserves();
+                (reserveIn, reserveOut) = zeroForOne ? (uint256(r0), uint256(r1)) : (uint256(r1), uint256(r0));
+            }
 
             uint256 feeBps = poolFeeBps[pool];
             if (feeBps == 0) feeBps = 30; // default 0.3%
