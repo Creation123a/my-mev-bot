@@ -408,11 +408,11 @@ contract FlashArbExecutor is
         (address token0, address token1, ) = _getPoolInfo(dexType, pool);
         (address tokenIn, address tokenOut) = zeroForOne ? (token0, token1) : (token1, token0);
 
-        // Continuity check
+                // Continuity check: ensure each hop's input token matches the previous hop's output.
         if (hop > 0) {
             address prevPool = _ctx.route.pools[hop - 1];
             bool prevZeroForOne = _ctx.route.zeroForOnes[hop - 1];
-            (address prevToken0, address prevToken1,) = _getPoolInfo(_ctx.route.dexTypes[hop - 1], prevPool);
+            (address prevToken0, address prevToken1, uint24 /* fee */) = _getPoolInfo(_ctx.route.dexTypes[hop - 1], prevPool);
             address prevTokenOut = prevZeroForOne ? prevToken1 : prevToken0;
             if (tokenIn != prevTokenOut) revert TokenContinuityFailed();
         }
