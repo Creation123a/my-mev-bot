@@ -1,0 +1,27 @@
+# Binaries and build artifacts
+/bin/
+/build/
+*.exe
+*.exe.manifest
+*.dll
+*.so
+*.dylib
+
+# Test and coverage artifacts
+*.test
+*.out
+coverage.txt
+
+# Environment and sensitive keys
+.env
+.env.local
+.env.*.local
+*.pem
+*.key
+
+# IDE and OS files
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
