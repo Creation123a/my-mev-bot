@@ -40,7 +40,7 @@ type V3Calculator struct {
 // NewV3Calculator creates a new calculator with pre‑allocated buffers.
 func NewV3Calculator() *V3Calculator {
 	c := &V3Calculator{}
-	c.Q96big.SetInt64(Q96)
+	c.Q96big.SetString("79228162514264337593543950336", 10)
 	c.maxSqrt.SetString("1461446703485210103287273052203988822378723970342", 10)
 	c.minSqrt.SetInt64(4295128739) // or 4295128740
 	return c
