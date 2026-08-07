@@ -412,7 +412,7 @@ contract FlashArbExecutor is
         if (hop > 0) {
             address prevPool = _ctx.route.pools[hop - 1];
             bool prevZeroForOne = _ctx.route.zeroForOnes[hop - 1];
-            (address prevToken0, address prevToken1, uint24 /* fee */) = _getPoolInfo(_ctx.route.dexTypes[hop - 1], prevPool);
+            (address prevToken0, address prevToken1, ) = _getPoolInfo(_ctx.route.dexTypes[hop - 1], prevPool);
             address prevTokenOut = prevZeroForOne ? prevToken1 : prevToken0;
             if (tokenIn != prevTokenOut) revert TokenContinuityFailed();
         }
