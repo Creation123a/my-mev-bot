@@ -212,7 +212,25 @@ func (p *PoolState) GetLiquidity() float64 {
 // =============================================================================
 // RouteCandidate — path solver output (supports 2-hop and 3-hop routes)
 // =============================================================================
+// Lock acquires the write lock for the pool.
+func (p *PoolState) Lock() {
+    p.mu.Lock()
+}
 
+// Unlock releases the write lock.
+func (p *PoolState) Unlock() {
+    p.mu.Unlock()
+}
+
+// RLock acquires the read lock.
+func (p *PoolState) RLock() {
+    p.mu.RLock()
+}
+
+// RUnlock releases the read lock.
+func (p *PoolState) RUnlock() {
+    p.mu.RUnlock()
+}
 type RouteCandidate struct {
 	Hops uint8 // 2 or 3
 
