@@ -11,7 +11,7 @@ import (
 	"sync"
 	"syscall"
 	"time"
-
+    "bytes"
 	"github.com/andybalholm/brotli"
 	"github.com/gorilla/websocket"
 
@@ -314,7 +314,7 @@ func readLoop(
 			rawMessage = payload
 		} else {
 			// Attempt Brotli decompression.
-			br.ResetBytes(payload)
+			br.Reset(bytes.NewReader(payload))
 			totalDecomp := 0
 			decompFailed := false
 			for {
