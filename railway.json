@@ -1,0 +1,9 @@
+{
+  "build": {
+    "builder": "NIXPACKS",
+    "buildCommand": "go mod tidy && go build -tags dryrun -ldflags=-w -s -o out ."
+  },
+  "deploy": {
+    "startCommand": "./out"
+  }
+}
