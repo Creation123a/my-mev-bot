@@ -1,0 +1,11 @@
+{
+  "$schema": "https://railway.com",
+  "build": {
+    "builder": "NIXPACKS",
+    "buildCommand": "go mod tidy && go build -o out ."
+  },
+  "deploy": {
+    "startCommand": "./out",
+    "restartPolicyOnFailure": "ON_FAILURE"
+  }
+}
