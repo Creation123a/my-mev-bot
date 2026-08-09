@@ -1,5 +1,5 @@
 # 1. Use the official lightweight Go environment
-FROM golang:1.21-alpine AS builder
+FROM golang:1.22-alpine AS builder
 
 # 2. Set the internal working path
 WORKDIR /app
