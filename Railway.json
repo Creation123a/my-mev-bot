@@ -1,13 +1,10 @@
 {
   "$schema": "https://railway.com",
   "build": {
-    "builder": "NIXPACKS"
+    "builder": "NIXPACKS",
+    "buildCommand": "go mod download && go mod tidy && go build -ldflags='-w -s' -o out ."
   },
   "deploy": {
-    "startCommand": "./out",
-    "restartPolicyOnFailure": "ON_FAILURE"
-  },
-  "vars": {
-    "NIXPACKS_BUILD_CMD": "go mod tidy && go build -ldflags='-w -s' -o out ."
+    "startCommand": "./out"
   }
 }
