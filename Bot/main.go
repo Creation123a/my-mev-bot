@@ -677,3 +677,20 @@ func dexName(t types.DexType) string {
 		return "Unknown"
 	}
 }
+
+// =================================================================
+// TESTING UTILITY: REMOVE THIS ENTIRE SECTION BEFORE MAINNET DEPLOY
+// =================================================================
+
+func SyncSandboxToLatest() {
+	sandboxID := "equal-gambit-e2c65aea" 
+
+	url := "https://buildbear.io" + sandboxID + "/reset"
+	jsonData := []byte(`{"blockNumber": "latest"}`)
+
+	resp, err := http.Post(url, "application/json", bytes.NewBuffer(jsonData))
+	if err != nil {
+		return
+	}
+	defer resp.Body.Close()
+}
