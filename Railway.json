@@ -2,7 +2,7 @@
   "$schema": "https://railway.com",
   "build": {
     "builder": "NIXPACKS",
-    "buildCommand": "go mod tidy && go build -o out ."
+    "buildCommand": "ln -sf config Bot/Config && go mod tidy && go build -o out ."
   },
   "deploy": {
     "startCommand": "./out",
