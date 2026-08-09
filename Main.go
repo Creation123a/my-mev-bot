@@ -1,5 +1,3 @@
-//go:build dryrun
-
 package main
 
 import (
