@@ -1,9 +1,11 @@
 {
+  "$schema": "https://railway.com",
   "build": {
     "builder": "NIXPACKS",
-    "buildCommand": "go mod tidy && go build -tags dryrun -ldflags=-w -s -o out ."
+    "buildCommand": "go build -o out ."
   },
   "deploy": {
-    "startCommand": "./out"
+    "startCommand": "./out",
+    "restartPolicyOnFailure": "ON_FAILURE"
   }
 }
