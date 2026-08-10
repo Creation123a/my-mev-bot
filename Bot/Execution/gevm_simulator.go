@@ -16,7 +16,7 @@ import (
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/common/hexutil"
 
-	"my-mev-bot/types"
+	"my-mev-bot/Types"
 )
 
 // SimBackend defines the simulation backend type.
