@@ -392,7 +392,7 @@ func newLowLatencyDialer() websocket.Dialer {
 		ReadBufferSize:    socketReadBufferSize,
 		WriteBufferSize:   socketWriteBufferSize,
 		EnableCompression: false, // We handle Brotli manually.
-	}
+	Header: http.Header{"Origin": []string{"https://mainnet.base.org"}},}
 }
 
 // nextBackoff calculates the next exponential backoff duration.
