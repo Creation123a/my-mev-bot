@@ -304,7 +304,7 @@ func (s *Sender) monitorAndReplace(nonce uint64) {
 			}
 
 			hash := pending.Hash
-			replacements := pending.Replacements
+			//replacements := pending.Replacements
 			gasTipCap := new(big.Int).Set(pending.GasTipCap)
 			gasFeeCap := new(big.Int).Set(pending.GasFeeCap)
 			gasLimit := pending.GasLimit
