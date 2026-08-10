@@ -19,9 +19,9 @@ import (
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/ethclient"
 
-	"my-mev-bot/config"
-	"my-mev-bot/solver"
-	"my-mev-bot/types"
+	"my-mev-bot/Config"
+	"my-mev-bot/Solver"
+	"my-mev-bot/Types"
 )
 
 type PendingTx struct {
