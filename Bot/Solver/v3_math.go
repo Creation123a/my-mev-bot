@@ -5,7 +5,7 @@ import (
 	"math/big"
 
 	"github.com/ethereum/go-ethereum/common"
-	"my-mev-bot/types"
+	"my-mev-bot/Bot/Types"
 )
 
 const (
