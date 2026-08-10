@@ -19,7 +19,7 @@ import (
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/ethclient"
 
-	"my-mev-bot/Bot/Config"
+	//"my-mev-bot/Bot/Config"
 	"my-mev-bot/Bot/Solver"
 	"my-mev-bot/Bot/Types"
 )
