@@ -20,13 +20,13 @@ import (
 	"github.com/ethereum/go-ethereum/ethclient"
 	"golang.org/x/sys/unix"
 
-	"my-mev-bot/config"
-	"my-mev-bot/dashboard"
-	"my-mev-bot/execution"
-	"my-mev-bot/ingestion"
-	"my-mev-bot/solver"
-	"my-mev-bot/state"
-	"my-mev-bot/types"
+	"my-mev-bot/Bot/config"
+	"my-mev-bot/Bot/dashboard"
+	"my-mev-bot/Bot/execution"
+	"my-mev-bot/Bot/ingestion"
+	"my-mev-bot/Bot/solver"
+	"my-mev-bot/Bot/state"
+	"my-mev-bot/Bot/types"
 )
 
 // ----- Copy of the original main() with dry‑run modifications -----
