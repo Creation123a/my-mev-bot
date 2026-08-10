@@ -6,7 +6,7 @@ import (
 	"fmt"
 
 	"github.com/ethereum/go-ethereum/common"
-	"my-mev-bot/Types"
+	"my-mev-bot/Bot/Types"
 )
 
 // =============================================================================
