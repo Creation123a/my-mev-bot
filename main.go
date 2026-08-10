@@ -583,7 +583,24 @@ func worker3(
 			}
 			nonce := nonceTracker.NextNonce()
 			payload.Nonce = nonce
+// ---------- DRY‑RUN MODE ----------
+if os.Getenv("DRY_RUN") == "true" {
+    log.Printf("[DRY-RUN] Would send tx | Nonce: %d | Profit: $%.2f | GasTip: %.3f Gwei | Route: %s",
+        nonce,
+        payload.MinProfitUSD,
+        float64(payload.PriorityFeeWei)/1e9,
+        payload.RouteDesc)
 
+    // Simulate a confirmation after 2 seconds (optional)
+    go func(p *types.ExecutionPayload, n uint64) {
+        time.Sleep(2 * time.Second)
+        log.Printf("[DRY-RUN] Simulated confirmation for nonce %d, profit $%.2f", n, p.MinProfitUSD)
+    }(payload, nonce)
+
+    putPayload(payload) // return to pool to avoid leak
+    continue
+}
+// ---------- END DRY‑RUN ----------
 			txHash, err := sender.SendRawTransaction(payload)
 			if err != nil {
 				nonceTracker.Rollback()
