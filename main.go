@@ -20,13 +20,13 @@ import (
 	"github.com/ethereum/go-ethereum/ethclient"
 	"golang.org/x/sys/unix"
 
-	"my-mev-bot/config"
-	"my-mev-bot/dashboard"
-	"my-mev-bot/execution"
-	"my-mev-bot/ingestion"
-	"my-mev-bot/solver"
-	"my-mev-bot/state"
-	"my-mev-bot/types"
+	"my-mev-bot/Bot/Config"
+	"my-mev-bot/Bot/Dashboard"
+	"my-mev-bot/Bot/Execution"
+	"my-mev-bot/Bot/Ingestion"
+	"my-mev-bot/Bot/Solver"
+	"my-mev-bot/Bot/State"
+	"my-mev-bot/Bot/Types"
 )
 
 const (
