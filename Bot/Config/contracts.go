@@ -76,8 +76,8 @@ var (
 	// If left as zero, the DEX type detection for V2 pools will default to Aerodrome V2.
 	UniswapV3Factory = common.HexToAddress("0x33128a8fC17869897dcE68Ed026d694621f6FDfD")
 	PancakeV3Factory = common.HexToAddress("0x0BFbCF9fa4f9C56B0F40a671Ad40E0805A091865")
-	AerodromeFactory = common.Address{} // TODO: Replace with actual Aerodrome V2 factory address
-	AlienBaseFactory = common.Address{} // TODO: Replace with actual AlienBase factory address
+	AerodromeFactory = common.HexToAddress("0x420DD3807Eae25ad71F4229994854528A4aBc3cd") // TODO: Replace with actual Aerodrome V2 factory address
+	AlienBaseFactory = common.HexToAddress("0x420DD3807Eae25ad71F4229994854528A4aBc3cd") // TODO: Replace with actual AlienBase factory address
 )
 
 // =============================================================================
