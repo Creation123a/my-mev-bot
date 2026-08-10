@@ -15,9 +15,9 @@ import (
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/ethclient"
 
-	"my-mev-bot/config"
-	"my-mev-bot/state"
-	"my-mev-bot/types"
+	"my-mev-bot/Bot/Config"
+	"my-mev-bot/Bot/State"
+	"my-mev-bot/Bot/Types"
 )
 
 const (
