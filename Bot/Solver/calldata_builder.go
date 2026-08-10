@@ -8,7 +8,7 @@ import (
 
 	"github.com/ethereum/go-ethereum/accounts/abi"
 	"github.com/ethereum/go-ethereum/common"
-	"my-mev-bot/types"
+	"my-mev-bot/Types"
 )
 
 // NOTE: This ABI definition must exactly match the Solidity contract's
