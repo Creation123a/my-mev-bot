@@ -12,6 +12,7 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+	"sort"
 	"time"
 
 	"github.com/ethereum/go-ethereum/common"
@@ -35,6 +36,7 @@ const (
 	executionChanSize     = 64
 	defaultGasLimit       = 500000
 	maxCandidatesPerEvent = 8
+	numSimWorkers         = 4
 )
 
 var (
@@ -50,6 +52,9 @@ var (
 	lastLogMu  sync.Mutex
 	lastSwapLog *types.SwapLog
 )
+
+// Global price cache used only in the fallback path of worker2.
+var globalPriceCache sync.Map
 
 var payloadPool = sync.Pool{
 	New: func() interface{} {
@@ -87,6 +92,10 @@ func main() {
 	// Validate factory addresses before starting.
 	if err := config.ValidateFactories(); err != nil {
 		log.Fatalf("Factory validation failed: %v", err)
+	}
+
+	if err := solver.InitExecutorABI(); err != nil {
+		log.Fatalf("failed to init executor ABI: %v", err)
 	}
 
 	dashServer = dashboard.NewDashboardServer()
@@ -139,6 +148,34 @@ func main() {
 	}
 
 	gevm := execution.NewGEVMSimulator(cfg.BaseHTTPRPC, ownerAddress, anvilRPC)
+	// Inject matrix for local EVM state.
+	gevm.SetMatrix(matrix)
+
+	// Create and warm state cache for local EVM.
+	stateCache := execution.NewStateCache()
+	// Warm up executor code.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	executorCode, err := ethClient.CodeAt(ctx, cfg.ExecutorAddress, nil)
+	if err != nil {
+		log.Printf("Warning: failed to fetch executor code: %v; local EVM may not work.", err)
+	} else {
+		stateCache.SetCode(cfg.ExecutorAddress, executorCode)
+	}
+	// Warm up core pools (anchors) by fetching their code.
+	for _, poolAddr := range anchors {
+		// We don't have a direct list of pool addresses; we'll fetch from matrix preload later.
+		// For now, we can fetch code for known pools if we had them.
+		// We'll rely on lazy fetching in SimulateNative or add a list.
+	}
+	gevm.SetStateCache(stateCache)
+
+	// Optionally, update block context once to avoid first stale block.
+	if err := gevm.UpdateBlockContext(ctx); err != nil {
+		log.Printf("Warning: initial block context update failed: %v", err)
+	}
+	gevm.StartBackgroundUpdater(ctx)
+
 	if anvilRPC != "" {
 		gevm.HealthCheckAnvil()
 		go func() {
@@ -167,7 +204,6 @@ func main() {
 	)
 
 	// Confirmation callback – currently reports estimated profit.
-	// TODO: derive realized profit from receipt.GasUsed and EffectiveGasPrice.
 	sender.SetConfirmationCallback(func(nonce uint64, txHash common.Hash, receipt *gethTypes.Receipt, payload *types.ExecutionPayload) {
 		profitUSD := payload.MinProfitUSD
 
@@ -186,32 +222,109 @@ func main() {
 			txHash.Hex(), profitUSD, payload.RouteDesc, receipt.BlockNumber.Uint64())
 	})
 
-	sender.SetSolverCallback(func(failedPool common.Address) []*types.RouteCandidate {
-		lastLogMu.Lock()
-		logEntry := lastSwapLog
-		lastLogMu.Unlock()
-		if logEntry == nil {
-			return nil
+	// --- Updated solver callback with RetryContext ---
+sender.SetSolverCallback(func(retryCtx execution.RetryContext) []*types.RouteCandidate {
+	lastLogMu.Lock()
+	logEntry := lastSwapLog
+	lastLogMu.Unlock()
+	if logEntry == nil {
+		return nil
+	}
+
+	// Generate fresh candidates using the original swap log.
+	allCands := solver.EvaluateEvent(logEntry, matrix, cfg)
+	if len(allCands) == 0 {
+		return nil
+	}
+
+	// Build a set of pools we want to avoid (failed route).
+	avoidPools := make(map[common.Address]bool)
+	for _, pool := range retryCtx.Pools {
+		if pool != (common.Address{}) {
+			avoidPools[pool] = true
 		}
-		allCands := solver.EvaluateEvent(logEntry, matrix, cfg)
-		if len(allCands) == 0 {
-			return nil
+	}
+
+	// Soft diversity scoring
+	type scoredCand struct {
+		cand  *types.RouteCandidate
+		score float64
+	}
+
+	var scored []scoredCand
+
+	for _, cand := range allCands {
+		// 1. Hard filter: must not use any pool from the failed route
+		usesFailedPool := false
+		for i := 0; i < int(cand.Hops); i++ {
+			if avoidPools[cand.Pools[i]] {
+				usesFailedPool = true
+				break
+			}
 		}
-		var filtered []*types.RouteCandidate
-		for _, cand := range allCands {
-			usesFailed := false
-			for i := 0; i < int(cand.Hops); i++ {
-				if cand.Pools[i] == failedPool {
-					usesFailed = true
-					break
+		if usesFailedPool {
+			continue
+		}
+
+		// 2. Soft score starting from expected profit
+		score := cand.ExpectedProfitUSD
+
+		// Bonus for different number of hops
+		if retryCtx.OriginalCandidate != nil && cand.Hops != retryCtx.OriginalCandidate.Hops {
+			score *= 1.15
+		}
+
+		// Penalty based on how many tokens are shared with the failed route
+		if retryCtx.OriginalCandidate != nil {
+			shared := 0
+			total := int(cand.Hops) + 1
+			origSet := make(map[common.Address]bool)
+			for _, t := range retryCtx.OriginalCandidate.Tokens[:retryCtx.OriginalCandidate.Hops+1] {
+				if t != (common.Address{}) {
+					origSet[t] = true
 				}
 			}
-			if !usesFailed {
-				filtered = append(filtered, cand)
+			for i := 0; i < total; i++ {
+				if origSet[cand.Tokens[i]] {
+					shared++
+				}
+			}
+			if total > 0 {
+				overlap := float64(shared) / float64(total)
+				score *= (1.0 - 0.4*overlap) // up to 40% penalty for full overlap
 			}
 		}
-		return filtered
+
+		scored = append(scored, scoredCand{cand: cand, score: score})
+	}
+
+	if len(scored) == 0 {
+		return nil
+	}
+
+	// Sort by score descending
+	sort.Slice(scored, func(i, j int) bool {
+		return scored[i].score > scored[j].score
 	})
+
+	// Return top 3
+	maxReturn := 3
+	if len(scored) < maxReturn {
+		maxReturn = len(scored)
+	}
+	filtered := make([]*types.RouteCandidate, maxReturn)
+	for i := 0; i < maxReturn; i++ {
+		filtered[i] = scored[i].cand
+	}
+	return filtered
+})
+
+	// Allow the sender to re-simulate alternatives during retry
+	sender.SetSimulateFunc(func(cand *types.RouteCandidate, payload *types.ExecutionPayload) (bool, uint64, error) {
+		return gevm.SimulateNative(payload)
+	})
+
+	
 
 	decoder := ingestion.NewDecoder()
 
@@ -219,15 +332,29 @@ func main() {
 	candidateChan := make(chan *types.RouteCandidate, candidateChanSize)
 	executionChan := make(chan *types.ExecutionPayload, executionChanSize)
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
 	solver.StartL1FeeUpdater(ethClient, ctx)
 
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 
-	go ingestion.StartWebSocketReader(ctx, cfg.BaseWSRPC, eventChan, decoder)
+	// WebSocket status channel.
+	statusChan := make(chan string, 1)
+	go ingestion.StartWebSocketReader(ctx, cfg.BaseWSRPC, eventChan, decoder, statusChan)
+
+	go func() {
+		for status := range statusChan {
+			switch status {
+			case "connected":
+				if dashServer != nil {
+					dashServer.SetConnectionStatus("🟢 Connected")
+				}
+			case "disconnected":
+				if dashServer != nil {
+					dashServer.SetConnectionStatus("🔴 Disconnected")
+				}
+			}
+		}
+	}()
 
 	var wg sync.WaitGroup
 
@@ -236,6 +363,7 @@ func main() {
 		cores = []int{2, 3, 4}
 	}
 
+	// Worker 1: Event ingestion → route generation
 	wg.Add(1)
 	go func() {
 		if cfg.EnableCPUPinning {
@@ -245,15 +373,20 @@ func main() {
 		worker1(ctx, eventChan, candidateChan, matrix, blacklist, lru, anchorSet, cfg)
 	}()
 
-	wg.Add(1)
-	go func() {
-		if cfg.EnableCPUPinning {
-			pinToCore(cores[1])
-		}
-		defer wg.Done()
-		worker2(ctx, candidateChan, executionChan, gevm, matrix, blacklist, anchorSet, cfg)
-	}()
+	// Worker pool for simulation & payload construction
+	for i := 0; i < numSimWorkers; i++ {
+		wg.Add(1)
+		go func(workerID int) {
+			// Optional CPU pinning if enough cores.
+			// if cfg.EnableCPUPinning && len(cores) > 2+workerID {
+			//     pinToCore(cores[2+workerID])
+			// }
+			defer wg.Done()
+			worker2(ctx, candidateChan, executionChan, gevm, matrix, blacklist, anchorSet, cfg)
+		}(i)
+	}
 
+	// Worker 3: Transaction sending
 	wg.Add(1)
 	go func() {
 		if cfg.EnableCPUPinning {
@@ -262,9 +395,6 @@ func main() {
 		defer wg.Done()
 		worker3(ctx, executionChan, sender, nonceTracker)
 	}()
-
-	// Removed the fixed‑timer connection status goroutine – dashboard status must be driven by WebSocket reader callbacks.
-	// TODO: Implement real WebSocket status updates.
 
 	<-sigChan
 	log.Println("\nShutting down gracefully...")
@@ -393,7 +523,6 @@ func worker1(
 }
 
 // getTokenDecimals returns the correct decimals for a token.
-// This overrides the solver package's version for cbBTC (8 decimals).
 func getTokenDecimals(token common.Address) int {
 	if token == config.USDCAddress || token == config.USDBCAddress {
 		return 6
@@ -468,11 +597,11 @@ func worker2(
 
 			minProfitWei := cand.NetProfitWei
 			if minProfitWei == nil || minProfitWei.Sign() <= 0 {
-				tokenPrice := solver.GetTokenPrice(loanToken, matrix)
+				tokenPrice := solver.GetTokenPrice(loanToken, matrix, &globalPriceCache)
 				if tokenPrice <= 0 {
 					tokenPrice = 1.0
 				}
-				decimals := getTokenDecimals(loanToken) // use local fixed function
+				decimals := getTokenDecimals(loanToken)
 				profitWei := new(big.Float).Mul(
 					big.NewFloat(cand.ExpectedProfitUSD/tokenPrice),
 					big.NewFloat(math.Pow10(decimals)),
@@ -497,6 +626,7 @@ func worker2(
 				continue
 			}
 
+			// Choose backend.
 			backend := gevm.ChooseBackend(cand)
 			simPayload := &types.ExecutionPayload{
 				TargetExecutor: cfg.ExecutorAddress,
@@ -504,7 +634,20 @@ func worker2(
 				GasLimit:       defaultGasLimit,
 			}
 
-			success, gasUsed, err := gevm.SimulateWithBackend(cand, simPayload, backend)
+			var success bool
+			var gasUsed uint64
+
+			if backend == execution.SimBackendLocal {
+				// Use native local EVM.
+				success, gasUsed, err = gevm.SimulateNative(simPayload)
+				if err != nil || !success {
+					// Fallback to remote on failure.
+					success, gasUsed, err = gevm.SimulateWithBackend(cand, simPayload, execution.SimBackendRemote)
+				}
+			} else {
+				success, gasUsed, err = gevm.SimulateWithBackend(cand, simPayload, backend)
+			}
+
 			if err != nil || !success {
 				reverted := (err != nil && strings.Contains(err.Error(), "execution reverted"))
 				if reverted {
@@ -531,7 +674,6 @@ func worker2(
 
 			adjustedProfitUSD := cand.ExpectedProfitUSD - totalGasCostUSD
 
-			// Reject candidate if gas‑adjusted profit is below minimum.
 			if adjustedProfitUSD < cfg.MinProfitUSD {
 				logDrop(cand, fmt.Errorf("gas-adjusted profit $%.2f below minimum $%.2f",
 					adjustedProfitUSD, cfg.MinProfitUSD))
@@ -555,6 +697,7 @@ func worker2(
 			payload.Nonce = 0
 			payload.RouteDesc = formatCandidateRoute(cand)
 			payload.RoutePools = make([]common.Address, int(cand.Hops))
+			payload.OriginalCandidate = cand
 			copy(payload.RoutePools, cand.Pools[:cand.Hops])
 
 			select {
@@ -583,24 +726,7 @@ func worker3(
 			}
 			nonce := nonceTracker.NextNonce()
 			payload.Nonce = nonce
-// ---------- DRY‑RUN MODE ----------
-if os.Getenv("DRY_RUN") == "true" {
-    log.Printf("[DRY-RUN] Would send tx | Nonce: %d | Profit: $%.2f | GasTip: %.3f Gwei | Route: %s",
-        nonce,
-        payload.MinProfitUSD,
-        float64(payload.PriorityFeeWei)/1e9,
-        payload.RouteDesc)
 
-    // Simulate a confirmation after 2 seconds (optional)
-    go func(p *types.ExecutionPayload, n uint64) {
-        time.Sleep(2 * time.Second)
-        log.Printf("[DRY-RUN] Simulated confirmation for nonce %d, profit $%.2f", n, p.MinProfitUSD)
-    }(payload, nonce)
-
-    putPayload(payload) // return to pool to avoid leak
-    continue
-}
-// ---------- END DRY‑RUN ----------
 			txHash, err := sender.SendRawTransaction(payload)
 			if err != nil {
 				nonceTracker.Rollback()
