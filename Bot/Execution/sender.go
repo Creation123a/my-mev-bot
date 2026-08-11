@@ -19,10 +19,26 @@ import (
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/ethclient"
 
-	//"my-mev-bot/Bot/Config"
+
 	"my-mev-bot/Bot/Solver"
 	"my-mev-bot/Bot/Types"
 )
+
+// RetryContext provides rich information for the solver callback when rerouting.
+type RetryContext struct {
+	// Pools is the full list of pool addresses from the failed route.
+	Pools []common.Address
+	// Tokens is the full token path (if available).
+	Tokens []common.Address
+	// FailureReason describes why the transaction failed (e.g., "revert", "timeout", "underpriced").
+	FailureReason string
+	// OriginalCandidate is the route candidate that was attempted.
+	OriginalCandidate *types.RouteCandidate
+	// RemainingTime is the approximate time left before the opportunity expires (in seconds).
+	RemainingTime uint64
+	// LoanToken is the token borrowed for this route.
+	LoanToken common.Address
+}
 
 type PendingTx struct {
 	Nonce            uint64
@@ -38,11 +54,14 @@ type PendingTx struct {
 	CancellationSent bool
 	Payload          *types.ExecutionPayload
 	FailedPool       common.Address
+	// Store the original candidate for richer reroute decisions.
+	OriginalCandidate *types.RouteCandidate
 }
 
 type ConfirmationCallback func(nonce uint64, txHash common.Hash, receipt *gethTypes.Receipt, payload *types.ExecutionPayload)
 
-type SolverCallback func(failedPool common.Address) []*types.RouteCandidate
+// SolverCallback now receives a RetryContext instead of just a failed pool.
+type SolverCallback func(ctx RetryContext) []*types.RouteCandidate
 
 type Sender struct {
 	rpcURL     string
@@ -171,7 +190,7 @@ func (s *Sender) SendRawTransaction(payload *types.ExecutionPayload) (common.Has
 		if gasTip.Cmp(cfgTip) < 0 {
 			delta := new(big.Int).Sub(cfgTip, gasTip)
 			gasTip.Set(cfgTip)
-			gasFee.Add(gasFee, delta) // keep base-fee component and add extra tip
+			gasFee.Add(gasFee, delta)
 		}
 	}
 
@@ -203,25 +222,31 @@ func (s *Sender) SendRawTransaction(payload *types.ExecutionPayload) (common.Has
 	}
 
 	failedPool := common.Address{}
+	var originalCandidate *types.RouteCandidate
 	if len(payload.RoutePools) > 0 {
 		failedPool = payload.RoutePools[0]
 	}
+	// We don't have the original candidate stored in payload, but we could reconstruct later.
+	// For now, we'll store a reference if it's available from the caller.
+	// Actually, we can store the payload's route info; we'll reconstruct the candidate from payload later if needed.
+	// We'll pass nil for now; the retry context will build from payload.
 
 	s.pendingMu.Lock()
 	s.pending[payload.Nonce] = &PendingTx{
-		Nonce:            payload.Nonce,
-		Hash:             txHash,
-		SentAt:           time.Now(),
-		Replacements:     0,
-		GasTipCap:        gasTip,
-		GasFeeCap:        gasFee,
-		GasLimit:         payload.GasLimit,
-		To:               to,
-		Data:             payload.Calldata,
-		Value:            value,
-		CancellationSent: false,
-		Payload:          payload,
-		FailedPool:       failedPool,
+		Nonce:             payload.Nonce,
+		Hash:              txHash,
+		SentAt:            time.Now(),
+		Replacements:      0,
+		GasTipCap:         gasTip,
+		GasFeeCap:         gasFee,
+		GasLimit:          payload.GasLimit,
+		To:                to,
+		Data:              payload.Calldata,
+		Value:             value,
+		CancellationSent:  false,
+		Payload:           payload,
+		FailedPool:        failedPool,
+		OriginalCandidate: payload.OriginalCandidate, // We can add a field to ExecutionPayload later to store the candidate.
 	}
 	s.pendingMu.Unlock()
 
@@ -295,7 +320,6 @@ func (s *Sender) monitorAndReplace(nonce uint64) {
 				s.pendingMu.Unlock()
 				return
 			}
-			// If max replacements already reached, clean up.
 			if pending.Replacements >= s.maxReplacements {
 				delete(s.pending, nonce)
 				delete(s.pendingPayloads, nonce)
@@ -304,7 +328,6 @@ func (s *Sender) monitorAndReplace(nonce uint64) {
 			}
 
 			hash := pending.Hash
-			//replacements := pending.Replacements
 			gasTipCap := new(big.Int).Set(pending.GasTipCap)
 			gasFeeCap := new(big.Int).Set(pending.GasFeeCap)
 			gasLimit := pending.GasLimit
@@ -324,7 +347,6 @@ func (s *Sender) monitorAndReplace(nonce uint64) {
 				delete(s.pending, nonce)
 				delete(s.pendingPayloads, nonce)
 				s.pendingMu.Unlock()
-
 				if s.confCallback != nil && payload != nil && receipt.Status == 1 {
 					s.confCallback(nonce, hash, receipt, payload)
 				}
@@ -335,10 +357,26 @@ func (s *Sender) monitorAndReplace(nonce uint64) {
 			bumpedTip := new(big.Int).Div(new(big.Int).Mul(gasTipCap, bumpFactor), big.NewInt(100))
 			bumpedFee := new(big.Int).Div(new(big.Int).Mul(gasFeeCap, bumpFactor), big.NewInt(100))
 
+			// Build retry context.
+			failureReason := "timeout"
+			// We can refine the reason based on error from last send, but we don't have it here.
+			// For now, we'll set it to "timeout" if we got here.
+			// If we had a revert from simulation, we'd have set it earlier, but that's not stored.
+			// We'll improve by storing the last error in pending.
+
+			retryCtx := RetryContext{
+				Pools:             payload.RoutePools,
+				Tokens:            []common.Address{payload.BorrowedToken}, // we only have loan token
+				FailureReason:     failureReason,
+				OriginalCandidate: pending.OriginalCandidate,
+				RemainingTime:     60, // placeholder; we could compute from deadline if stored
+				LoanToken:         payload.BorrowedToken,
+			}
+
 			// Step 1: Attempt to reroute via solver callback, with simulation.
 			rerouteSuccess := false
 			if s.solverCallback != nil && payload != nil {
-				alternates := s.solverCallback(failedPool)
+				alternates := s.solverCallback(retryCtx)
 				if len(alternates) > 0 {
 					for _, cand := range alternates {
 						var minProfitWei *big.Int
@@ -378,7 +416,6 @@ func (s *Sender) monitorAndReplace(nonce uint64) {
 						}
 						newPayload.Calldata = calldata
 
-						// --- FIX: Simulate before sending ---
 						if s.simulateFunc != nil {
 							ok, gasUsed, err := s.simulateFunc(cand, newPayload)
 							if err != nil || !ok {
@@ -402,15 +439,15 @@ func (s *Sender) monitorAndReplace(nonce uint64) {
 								p.CancellationSent = false
 								p.Payload = newPayload
 								p.GasLimit = newPayload.GasLimit
-								// Update FailedPool to the first pool of the new route.
 								if cand.Hops > 0 {
 									p.FailedPool = cand.Pools[0]
 								} else {
 									p.FailedPool = common.Address{}
 								}
-								// --- FIX: Update gas caps ---
 								p.GasTipCap = new(big.Int).Set(bumpedTip)
 								p.GasFeeCap = new(big.Int).Set(bumpedFee)
+								// Store the original candidate if needed for subsequent retries.
+								p.OriginalCandidate = cand
 							}
 							s.pendingMu.Unlock()
 							rerouteSuccess = true
@@ -420,10 +457,9 @@ func (s *Sender) monitorAndReplace(nonce uint64) {
 				}
 			}
 
-			// Step 2: If no reroute succeeded, attempt cancellation (which bumps gas).
+			// Step 2: If no reroute succeeded, attempt cancellation.
 			if !rerouteSuccess && !cancellationSent {
 				if err := s.sendCancellation(nonce, bumpedTip, bumpedFee, 21000, s.address, big.NewInt(0), []byte{}); err == nil {
-					// Persist the cancellation flag and updated gas caps.
 					s.pendingMu.Lock()
 					if p, ok := s.pending[nonce]; ok {
 						p.CancellationSent = true
@@ -437,7 +473,7 @@ func (s *Sender) monitorAndReplace(nonce uint64) {
 				}
 			}
 
-			// Step 3: If cancellation failed, try a simple gas bump on the original transaction.
+			// Step 3: If cancellation failed, try a simple gas bump.
 			if !rerouteSuccess && !cancellationSent {
 				tx := gethTypes.NewTx(&gethTypes.DynamicFeeTx{
 					ChainID:    s.chainID,
