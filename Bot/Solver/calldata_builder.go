@@ -8,6 +8,7 @@ import (
 
 	"github.com/ethereum/go-ethereum/accounts/abi"
 	"github.com/ethereum/go-ethereum/common"
+
 	"my-mev-bot/Bot/Types"
 )
 
@@ -16,10 +17,31 @@ import (
 // Any mismatch will cause all transactions to revert with "invalid route".
 // Keep this in sync with the on‑chain contract.
 
+// Pre‑computed error selectors (for consistency with GEVM)
+var (
+	ErrInsufficientProfitSelector  = common.HexToHash("0x0b1f0c7e").Bytes()[:4]
+	ErrInsufficientOutputSelector  = common.HexToHash("0x4f5e2789").Bytes()[:4]
+	ErrSwapExecutionFailedSelector = common.HexToHash("0x446da0c9").Bytes()[:4]
+	ErrLoanRepaymentFailedSelector = common.HexToHash("0x09d6f424").Bytes()[:4]
+)
 // executeSelector is computed from the actual Solidity function signature:
 // executeArbitrage(uint8,address,address,uint256,(address[],uint8[],bool[],uint256[],uint256),uint256,uint256)
 var executeSelector [4]byte
 var arbABI *abi.ABI
+
+// InitExecutorABI ensures the ABI is ready.
+// Safe to call multiple times. Currently just forces the init() to run.
+func InitExecutorABI() error {
+	// The real work is done in init(). This function exists so main.go
+	// can call it and fail early if something went wrong during package init.
+	if arbABI == nil {
+		return fmt.Errorf("executor ABI failed to initialize")
+	}
+	if executeSelector == [4]byte{} {
+		return fmt.Errorf("executeArbitrage selector is empty")
+	}
+	return nil
+}
 
 func init() {
 	// Define the ABI for the executeArbitrage function
