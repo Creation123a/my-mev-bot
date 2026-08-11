@@ -1,7 +1,9 @@
 package ingestion
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log"
@@ -11,7 +13,7 @@ import (
 	"sync"
 	"syscall"
 	"time"
-    "bytes"
+
 	"github.com/andybalholm/brotli"
 	"github.com/gorilla/websocket"
 
@@ -104,9 +106,8 @@ func StartWebSocketReader(
 	wsURL string,
 	eventChan chan<- *types.SwapLog,
 	decoder *Decoder,
+	statusChan chan<- string,
 ) {
-	// Build subscription message with known pool addresses if any are set.
-	// If the list is empty or only contains placeholders, use "address": null.
 	var validAddresses []string
 	for _, addr := range knownPoolAddresses {
 		trimmed := strings.TrimSpace(addr)
@@ -119,7 +120,6 @@ func StartWebSocketReader(
 	if len(validAddresses) == 0 {
 		addressFilter = "null"
 	} else {
-		// Build a properly quoted JSON array.
 		quoted := make([]string, len(validAddresses))
 		for i, addr := range validAddresses {
 			quoted[i] = `"` + addr + `"`
@@ -152,7 +152,6 @@ func StartWebSocketReader(
 			time.Sleep(backoff)
 			continue
 		}
-		// Record connection time to determine stability.
 		connectedAt := time.Now()
 
 		// Configure connection keep-alive and read deadlines.
@@ -167,7 +166,6 @@ func StartWebSocketReader(
 			return conn.SetReadDeadline(time.Now().Add(pongWait))
 		})
 
-		// Mutex for all websocket writes (ping, subscription, etc.)
 		var writeMu sync.Mutex
 
 		// Start ping ticker goroutine.
@@ -206,7 +204,15 @@ func StartWebSocketReader(
 
 		log.Println("[WebSocket] Connected and subscribed to Swap events.")
 
-		// Run the read loop; if it returns an error, we will reconnect.
+		// --- SEND CONNECTED STATUS ---
+		if statusChan != nil {
+			select {
+			case statusChan <- "connected":
+			default:
+			}
+		}
+
+		// Run the read loop.
 		if err := readLoop(ctx, conn, eventChan, decoder, &writeMu); err != nil {
 			log.Printf("[WebSocket] Read loop terminated: %v", err)
 		}
@@ -214,13 +220,21 @@ func StartWebSocketReader(
 		stopPing()
 		conn.Close()
 
+		// --- SEND DISCONNECTED STATUS ---
+		if statusChan != nil {
+			select {
+			case statusChan <- "disconnected":
+			default:
+			}
+		}
+
 		// Apply backoff only if the connection was unstable (short-lived).
 		if time.Since(connectedAt) < minStableConnection {
 			backoff = nextBackoff(backoff)
 			log.Printf("[WebSocket] Connection unstable; backing off %v", backoff)
 			time.Sleep(backoff)
 		} else {
-			backoff = 0 // reset backoff after a stable connection
+			backoff = 0
 		}
 		log.Println("[WebSocket] Connection closed. Reconnecting...")
 	}
@@ -262,7 +276,6 @@ func readLoop(
 
 		// Ignore non-text/binary messages.
 		if msgType != websocket.TextMessage && msgType != websocket.BinaryMessage {
-			// Drain and ignore.
 			_, _ = reader.Read(readBuffer[:])
 			continue
 		}
@@ -274,19 +287,15 @@ func readLoop(
 			n, err := reader.Read(readBuffer[totalRead:decompressionBufferSize])
 			totalRead += n
 			if err == io.EOF {
-				// End of message; break out of the read loop.
 				break
 			}
 			if err != nil {
 				return err
 			}
-			// If we've filled the buffer and the message is not complete (err == nil),
-			// then the payload exceeds the buffer size.
 			if totalRead >= decompressionBufferSize {
 				log.Printf("[WebSocket] Payload exceeds %d bytes; dropping message", decompressionBufferSize)
 				truncated = true
-				// Drain remaining data to avoid leaving the connection in a bad state.
-				// We can read and discard until EOF.
+				// Drain remaining data.
 				for {
 					var dummy [4096]byte
 					_, err := reader.Read(dummy[:])
@@ -305,15 +314,11 @@ func readLoop(
 		}
 		payload := readBuffer[:totalRead]
 
-		// Determine if the payload is JSON (likely uncompressed) or requires Brotli decompression.
-		// We do NOT rely on the non-standard 0xCF 0x57 magic bytes. Instead, we treat any payload
-		// that starts with '{' or '[' (after whitespace) as JSON and leave it as-is.
-		// All other payloads are attempted as Brotli-compressed.
+		// Determine if the payload is JSON or requires Brotli decompression.
 		var rawMessage []byte
 		if isLikelyJSON(payload) {
 			rawMessage = payload
 		} else {
-			// Attempt Brotli decompression.
 			br.Reset(bytes.NewReader(payload))
 			totalDecomp := 0
 			decompFailed := false
@@ -335,7 +340,6 @@ func readLoop(
 					break
 				}
 				if n == 0 {
-					// No progress and no error; avoid infinite loop.
 					log.Printf("[WebSocket] Brotli decompression stalled (n=0, err=nil)")
 					decompFailed = true
 					break
@@ -347,21 +351,47 @@ func readLoop(
 			rawMessage = decompressionBuffer[:totalDecomp]
 		}
 
-		// Obtain a SwapLog from the pool.
+		// Unwrap JSON‑RPC envelope.
+		var rpcMsg struct {
+			JSONRPC string `json:"jsonrpc"`
+			Method  string `json:"method"`
+			Params  struct {
+				Subscription string          `json:"subscription"`
+				Result       json.RawMessage `json:"result"`
+			} `json:"params"`
+			Result json.RawMessage `json:"result"`
+			ID     interface{}     `json:"id"`
+		}
+		if err := json.Unmarshal(rawMessage, &rpcMsg); err != nil {
+			log.Printf("[WebSocket] JSON-RPC parse error: %v", err)
+			continue
+		}
+
+		var logData []byte
+		if rpcMsg.Method == "eth_subscription" {
+			logData = rpcMsg.Params.Result
+		} else if rpcMsg.Result != nil && rpcMsg.ID != nil {
+			// Subscription response – ignore.
+			continue
+		} else {
+			log.Printf("[WebSocket] Unknown JSON-RPC message: %s", rawMessage)
+			continue
+		}
+
+		if len(logData) == 0 {
+			continue
+		}
+
 		swapLog := GetSwapLog()
-		// Parse the raw JSON log into the SwapLog struct.
-		if err := decoder.ParseSwapLog(rawMessage, swapLog); err != nil {
-			// Parsing failed; return the object to the pool and continue.
+		if err := decoder.ParseSwapLog(logData, swapLog); err != nil {
+			log.Printf("[WebSocket] Parse error: %v", err)
 			PutSwapLog(swapLog)
 			continue
 		}
 
-		// Non-blocking send to the event channel.
 		select {
 		case eventChan <- swapLog:
-			// Successfully sent; ownership transferred.
 		default:
-			// Channel full; drop this event and return to pool.
 			PutSwapLog(swapLog)
 		}
 	}
@@ -375,7 +405,6 @@ func newLowLatencyDialer() websocket.Dialer {
 		Control: func(network, address string, c syscall.RawConn) error {
 			var err error
 			controlErr := c.Control(func(fd uintptr) {
-				// Disable Nagle's algorithm for low latency.
 				if e := syscall.SetsockoptInt(int(fd), syscall.IPPROTO_TCP, syscall.TCP_NODELAY, 1); e != nil {
 					err = e
 				}
@@ -391,8 +420,8 @@ func newLowLatencyDialer() websocket.Dialer {
 		NetDial:           netDialer.Dial,
 		ReadBufferSize:    socketReadBufferSize,
 		WriteBufferSize:   socketWriteBufferSize,
-		EnableCompression: false, // We handle Brotli manually.
-	Header: http.Header{"Origin": []string{"https://mainnet.base.org"}},}
+		EnableCompression: false,
+	}
 }
 
 // nextBackoff calculates the next exponential backoff duration.
