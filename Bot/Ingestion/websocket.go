@@ -17,7 +17,7 @@ import (
 	"github.com/andybalholm/brotli"
 	"github.com/gorilla/websocket"
 
-	"my-mev-bot/Bot/Types"
+	"my-mev-bot/types"
 )
 
 const (
@@ -32,19 +32,38 @@ const (
 )
 
 // knownPoolAddresses is a list of known DEX pool addresses to filter the WebSocket subscription.
-// Replace the placeholder "0x..." with actual Base mainnet pool addresses.
+// All pools are from Base mainnet. Duplicates are removed.
 var knownPoolAddresses = []string{
-	// Uniswap V3
-	// "0x...", // WETH/USDC
-	// "0x...", // WETH/USDbC
-	// "0x...", // cbBTC/USDC
-	// "0x...", // cbBTC/USDbC
-	// PancakeSwap V3
-	// "0x...",
-	// Aerodrome V2
-	// "0x...",
-	// AlienBase V2
-	// "0x...",
+	// ---------- Uniswap V3 ----------
+	"0xd0b53D9277af78126b47ab508A631899178E6e42", // WETH/USDC
+	"0x4C36388bE6FAbAA7564619999281aE76E8E62215", // WETH/USDbC
+	"0x7aea2e8a3843516afa07293a10ac8e49906dabd1", // WETH/cbBTC
+	"0x067160ED01a3F5c0F1f71a93C70D2168324eA7B7", // USDC/USDbC
+	"0xac6baB98ff2aE5a727c9D86dfFA2c358B7Cc98fC", // USDC/cbBTC
+	"0xb231F830e2f5b4E9D47D937B6B040B47A1df9A8F", // USDbC/cbBTC
+
+	// ---------- PancakeSwap V3 ----------
+	"0x72AB388E2E2F6FaceF59E3C3FA2C4E29011c2D38", // WETH/USDC (0.01%)
+	"0xb775272e537cc670c65dc852908ad47015244eaf", // WETH/USDbC (0.05%)
+	"0xc211e1f853a898bd1302385ccde55f33a8c4b3f3", // WETH/cbBTC (0.05%)
+	"0x29ed55b18af0add137952cb3e29fb77b32fce426", // USDC/USDbC (0.01%)
+	// USDC/cbBTC and USDbC/cbBTC are the same addresses as Uniswap V3, so omitted.
+
+	// ---------- Aerodrome V2 ----------
+	"0xcF77a3Ba9A5CA399B7c97c74d54e5b1Beb874E43", // WETH/USDC
+	"0xB69c5339CD8993fa2B1a129033324fE45307b22d", // WETH/USDbC
+	"0x2A9A3fe6B1a798fB4a4f8990d0b04aFdE68A8b2a2", // WETH/cbBTC
+	"0x83B3a5BfD5Cd5fDCD40fBD58E783307559eED3E63", // USDC/cbBTC
+	"0x89D916B87Fa6bA90dcbA90dcbA90606B4b3F47Df", // USDbC/cbBTC
+	// USDC/USDbC stable pool address is a placeholder and omitted.
+
+	// ---------- AlienBase V2 ----------
+	"0x9eD4D83BDBd987D0C94B3CDe89B064CdDE697aAF", // WETH/USDC
+	"0x489679261dfA296DcbF2d08FA08E681966C3E480", // WETH/USDbC
+	"0x3018CC672e8113426743FA41bE5B876fe6D9B4A0", // WETH/cbBTC
+	"0x32FF1E4e8e16e6d15Db697E027B911438992b8dB", // USDC/USDbC
+	"0xdE232Eca8509FDb968E8E98Bfe0b05bA37cb7df7", // USDC/cbBTC
+	"0xc864a781F4Bba249bc1c49bA90dcbA90606B4b3F", // USDbC/cbBTC
 }
 
 // SwapLogPool is a sync.Pool of types.SwapLog to reuse objects.
