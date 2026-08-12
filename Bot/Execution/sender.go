@@ -246,7 +246,7 @@ func (s *Sender) SendRawTransaction(payload *types.ExecutionPayload) (common.Has
 		CancellationSent:  false,
 		Payload:           payload,
 		FailedPool:        failedPool,
-		OriginalCandidate: payload.OriginalCandidate, // We can add a field to ExecutionPayload later to store the candidate.
+		//OriginalCandidate: payload.OriginalCandidate, // We can add a field to ExecutionPayload later to store the candidate.
 	}
 	s.pendingMu.Unlock()
 
@@ -336,7 +336,7 @@ func (s *Sender) monitorAndReplace(nonce uint64) {
 			value := new(big.Int).Set(pending.Value)
 			cancellationSent := pending.CancellationSent
 			payload := pending.Payload
-			failedPool := pending.FailedPool
+			//failedPool := pending.FailedPool
 			s.pendingMu.Unlock()
 
 			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
