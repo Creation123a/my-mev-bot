@@ -19,13 +19,14 @@ import (
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/common/hexutil"
 	"github.com/ethereum/go-ethereum/core"
-	gethstate "github.com/ethereum/go-ethereum/core/state"
 	"github.com/ethereum/go-ethereum/core/rawdb"
+	"github.com/ethereum/go-ethereum/core/state"
 	"github.com/ethereum/go-ethereum/core/vm"
 	"github.com/ethereum/go-ethereum/ethclient"
 	"github.com/ethereum/go-ethereum/ethdb"
 	"github.com/ethereum/go-ethereum/params"
 	"github.com/ethereum/go-ethereum/trie"
+	"github.com/holiman/uint256"
 
 	"my-mev-bot/Bot/State"
 	"my-mev-bot/Bot/Types"
@@ -134,7 +135,7 @@ type GEVMSimulator struct {
 
 	// Native EVM state (in‑memory, zero‑latency).
 	nativeDB    ethdb.Database
-	nativeState *gethstate.StateDB
+	nativeState *state.StateDB
 	blockCtx    vm.BlockContext
 	txCtx       vm.TxContext
 	chainConfig *params.ChainConfig
@@ -162,14 +163,14 @@ func NewGEVMSimulator(rpcURL string, owner common.Address, anvilURL string) *GEV
 
 	// Initialise native in‑memory EVM state.
 	memDB := rawdb.NewMemoryDatabase()
-	trieDB := trie.NewDatabase(memDB, trie.NewConfig())
-	stateDB, err := gethstate.New(common.Hash{}, trieDB)
+	trieDB := trie.NewDatabase(memDB) // v1.13.15: only one parameter
+	stateDB, err := state.New(common.Hash{}, trieDB, nil) // v1.13.15: three parameters
 	if err != nil {
 		panic(fmt.Sprintf("failed to init native state: %v", err))
 	}
 
-	// Base chain config for Base mainnet.
-	chainCfg := params.BaseChainConfig
+	// Use MainnetChainConfig as a baseline; Base is EVM-compatible.
+	chainCfg := params.MainnetChainConfig
 
 	// Default block context (will be updated via RPC).
 	blockCtx := vm.BlockContext{
@@ -410,7 +411,7 @@ func (g *GEVMSimulator) UpdateBlockContext(ctx context.Context) error {
 }
 
 // injectPoolState writes the current pool state from the matrix into the StateDB.
-func (g *GEVMSimulator) injectPoolState(stateDB *gethstate.StateDB, pool *types.PoolState) {
+func (g *GEVMSimulator) injectPoolState(stateDB *state.StateDB, pool *types.PoolState) {
 	if pool == nil {
 		return
 	}
@@ -483,8 +484,8 @@ func (g *GEVMSimulator) SimulateNative(
 	g.evmMu.Lock()
 	// Create a fresh state for this simulation to avoid contaminating the base state.
 	root := g.nativeState.IntermediateRoot(false)
-	trieDB := trie.NewDatabase(g.nativeDB, trie.NewConfig())
-	newState, err := gethstate.New(root, trieDB)
+	trieDB := trie.NewDatabase(g.nativeDB) // v1.13.15: one param
+	newState, err := state.New(root, trieDB, nil) // v1.13.15: three params
 	if err != nil {
 		g.evmMu.Unlock()
 		return false, 0, fmt.Errorf("failed to copy state: %w", err)
@@ -526,7 +527,7 @@ func (g *GEVMSimulator) SimulateNative(
 		payload.TargetExecutor,
 		payload.Calldata,
 		payload.GasLimit,
-		big.NewInt(0), // value
+		uint256.NewInt(0), // v1.13.15: use *uint256.Int
 	)
 	gasUsed := payload.GasLimit - leftOverGas
 
