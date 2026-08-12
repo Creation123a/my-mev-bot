@@ -17,7 +17,7 @@ import (
 	"github.com/andybalholm/brotli"
 	"github.com/gorilla/websocket"
 
-	"my-mev-bot/types"
+	"my-mev-bot/Bot/Types"
 )
 
 const (
