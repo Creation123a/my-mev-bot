@@ -19,8 +19,8 @@ import (
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/common/hexutil"
 	"github.com/ethereum/go-ethereum/core"
+	gethstate "github.com/ethereum/go-ethereum/core/state"
 	"github.com/ethereum/go-ethereum/core/rawdb"
-	"github.com/ethereum/go-ethereum/core/state"
 	"github.com/ethereum/go-ethereum/core/vm"
 	"github.com/ethereum/go-ethereum/ethclient"
 	"github.com/ethereum/go-ethereum/ethdb"
@@ -134,7 +134,7 @@ type GEVMSimulator struct {
 
 	// Native EVM state (in‑memory, zero‑latency).
 	nativeDB    ethdb.Database
-	nativeState *state.StateDB
+	nativeState *gethstate.StateDB
 	blockCtx    vm.BlockContext
 	txCtx       vm.TxContext
 	chainConfig *params.ChainConfig
@@ -163,7 +163,7 @@ func NewGEVMSimulator(rpcURL string, owner common.Address, anvilURL string) *GEV
 	// Initialise native in‑memory EVM state.
 	memDB := rawdb.NewMemoryDatabase()
 	trieDB := trie.NewDatabase(memDB, trie.NewConfig())
-	stateDB, err := state.New(common.Hash{}, trieDB)
+	stateDB, err := gethstate.New(common.Hash{}, trieDB)
 	if err != nil {
 		panic(fmt.Sprintf("failed to init native state: %v", err))
 	}
@@ -409,9 +409,8 @@ func (g *GEVMSimulator) UpdateBlockContext(ctx context.Context) error {
 	return nil
 }
 
-// ---- FIXED: injectPoolState with correct V3 slot0 packing and nil guards ----
 // injectPoolState writes the current pool state from the matrix into the StateDB.
-func (g *GEVMSimulator) injectPoolState(stateDB *state.StateDB, pool *types.PoolState) {
+func (g *GEVMSimulator) injectPoolState(stateDB *gethstate.StateDB, pool *types.PoolState) {
 	if pool == nil {
 		return
 	}
@@ -485,7 +484,7 @@ func (g *GEVMSimulator) SimulateNative(
 	// Create a fresh state for this simulation to avoid contaminating the base state.
 	root := g.nativeState.IntermediateRoot(false)
 	trieDB := trie.NewDatabase(g.nativeDB, trie.NewConfig())
-	newState, err := state.New(root, trieDB)
+	newState, err := gethstate.New(root, trieDB)
 	if err != nil {
 		g.evmMu.Unlock()
 		return false, 0, fmt.Errorf("failed to copy state: %w", err)
