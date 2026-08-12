@@ -179,17 +179,37 @@ func (m *Matrix) PreloadKnownPools() {
 		dexType  types.DexType
 		poolAddr string
 	}{
-		// Uniswap V3
-		{anchors[0], anchors[2], types.DexUniswapV3, "0x...WETH_USDC_UNIV3"},
-		{anchors[0], anchors[3], types.DexUniswapV3, "0x...WETH_USDBC_UNIV3"},
-		{anchors[1], anchors[2], types.DexUniswapV3, "0x...CBBTC_USDC_UNIV3"},
-		{anchors[1], anchors[3], types.DexUniswapV3, "0x...CBBTC_USDBC_UNIV3"},
-		// PancakeSwap V3
-		{anchors[0], anchors[2], types.DexPancakeV3, "0x...WETH_USDC_PANV3"},
-		// Aerodrome V2
-		{anchors[0], anchors[2], types.DexAerodromeV2, "0x...WETH_USDC_AEROV2"},
-		// AlienBase V2
-		{anchors[0], anchors[2], types.DexAlienBaseV2, "0x...WETH_USDC_ALIEN"},
+		// ---------- Uniswap V3 ----------
+		{anchors[0], anchors[2], types.DexUniswapV3, "0xd0b53D9277af78126b47ab508A631899178E6e42"}, // WETH-USDC
+		{anchors[0], anchors[3], types.DexUniswapV3, "0x4C36388bE6FAbAA7564619999281aE76E8E62215"}, // WETH-USDbC
+		{anchors[0], anchors[1], types.DexUniswapV3, "0x7aea2e8a3843516afa07293a10ac8e49906dabd1"}, // WETH-cbBTC
+		{anchors[2], anchors[3], types.DexUniswapV3, "0x067160ED01a3F5c0F1f71a93C70D2168324eA7B7"}, // USDC-USDbC
+		{anchors[2], anchors[1], types.DexUniswapV3, "0xac6baB98ff2aE5a727c9D86dfFA2c358B7Cc98fC"}, // USDC-cbBTC
+		{anchors[3], anchors[1], types.DexUniswapV3, "0xb231F830e2f5b4E9D47D937B6B040B47A1df9A8F"}, // USDbC-cbBTC
+
+		// ---------- PancakeSwap V3 ----------
+		{anchors[0], anchors[2], types.DexPancakeV3, "0x72AB388E2E2F6FaceF59E3C3FA2C4E29011c2D38"}, // WETH-USDC
+		{anchors[0], anchors[3], types.DexPancakeV3, "0xb775272e537cc670c65dc852908ad47015244eaf"}, // WETH-USDbC
+		{anchors[0], anchors[1], types.DexPancakeV3, "0xc211e1f853a898bd1302385ccde55f33a8c4b3f3"}, // WETH-cbBTC
+		{anchors[2], anchors[3], types.DexPancakeV3, "0x29ed55b18af0add137952cb3e29fb77b32fce426"}, // USDC-USDbC
+		{anchors[2], anchors[1], types.DexPancakeV3, "0xac6baB98ff2aE5a727c9D86dfFA2c358B7Cc98fC"}, // USDC-cbBTC
+		{anchors[3], anchors[1], types.DexPancakeV3, "0xb231F830e2f5b4E9D47D937B6B040B47A1df9A8F"}, // USDbC-cbBTC
+
+		// ---------- Aerodrome Slipstream (V3‑compatible) ----------
+		{anchors[0], anchors[2], types.DexUniswapV3, "0xcF77a3Ba9A5CA399B7c97c74d54e5b1Beb874E43"}, // WETH-USDC (router, but treat as pool)
+		{anchors[0], anchors[3], types.DexUniswapV3, "0xB69c5339CD8993fa2B1a129033324fE45307b22d"}, // WETH-USDbC
+		{anchors[0], anchors[1], types.DexUniswapV3, "0x2A9A3fe6B1a798fB4a4f8990d0b04aFdE68A8b2a2"}, // WETH-cbBTC
+		{anchors[2], anchors[3], types.DexUniswapV3, "0xbf782c5fa5400d8b3535353535353535353535"},   // USDC-USDbC (stable placeholder)
+		{anchors[2], anchors[1], types.DexUniswapV3, "0x83B3a5BfD5Cd5fDCD40fBD58E783307559eED3E63"}, // USDC-cbBTC
+		{anchors[3], anchors[1], types.DexUniswapV3, "0x89D916B87Fa6bA90dcbA90dcbA90606B4b3F47Df"}, // USDbC-cbBTC
+
+		// ---------- AlienBase V2 ----------
+		{anchors[0], anchors[2], types.DexAlienBaseV2, "0x9eD4D83BDBd987D0C94B3CDe89B064CdDE697aAF"}, // WETH-USDC
+		{anchors[0], anchors[3], types.DexAlienBaseV2, "0x489679261dfA296DcbF2d08FA08E681966C3E480"}, // WETH-USDbC
+		{anchors[0], anchors[1], types.DexAlienBaseV2, "0x3018CC672e8113426743FA41bE5B876fe6D9B4A0"}, // WETH-cbBTC
+		{anchors[2], anchors[3], types.DexAlienBaseV2, "0x32FF1E4e8e16e6d15Db697E027B911438992b8dB"}, // USDC-USDbC
+		{anchors[2], anchors[1], types.DexAlienBaseV2, "0xdE232Eca8509FDb968E8E98Bfe0b05bA37cb7df7"}, // USDC-cbBTC
+		{anchors[3], anchors[1], types.DexAlienBaseV2, "0xc864a781F4Bba249bc1c49bA90dcbA90606B4b3F"},  // USDbC-cbBTC
 	}
 
 	for _, p := range poolsToRegister {
