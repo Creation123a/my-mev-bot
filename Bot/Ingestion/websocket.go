@@ -32,12 +32,7 @@ const (
 )
 
 // knownPoolAddresses is a list of known DEX pool addresses to filter the WebSocket subscription.
-// This reduces incoming message volume by only receiving events for these pools.
 // Replace the placeholder "0x..." with actual Base mainnet pool addresses.
-// Leave empty or with placeholders to fallback to no address filter.
-// TODO: Fill these with real Base mainnet pool addresses before production deployment.
-// You can obtain them from Basescan or the respective DEX factory contracts.
-// For Uniswap V3 WETH/USDC on Base, the pool address is 0x... (check Basescan).
 var knownPoolAddresses = []string{
 	// Uniswap V3
 	// "0x...", // WETH/USDC
@@ -80,7 +75,6 @@ func redactURL(raw string) string {
 }
 
 // isLikelyJSON returns true if the payload appears to be a JSON object or array after trimming whitespace.
-// This is used to distinguish uncompressed JSON from Brotli-compressed binary data.
 func isLikelyJSON(data []byte) bool {
 	i := 0
 	for i < len(data) {
@@ -108,6 +102,7 @@ func StartWebSocketReader(
 	decoder *Decoder,
 	statusChan chan<- string,
 ) {
+	// Prepare address filter.
 	var validAddresses []string
 	for _, addr := range knownPoolAddresses {
 		trimmed := strings.TrimSpace(addr)
@@ -116,22 +111,35 @@ func StartWebSocketReader(
 		}
 	}
 
-	var addressFilter string
-	if len(validAddresses) == 0 {
-		addressFilter = "null"
-	} else {
-		quoted := make([]string, len(validAddresses))
-		for i, addr := range validAddresses {
-			quoted[i] = `"` + addr + `"`
-		}
-		addressFilter = "[" + strings.Join(quoted, ",") + "]"
-	}
-
 	if len(validAddresses) == 0 {
 		log.Println("[WebSocket] WARNING: No pool addresses configured; subscribing to ALL swap events. This may cause high bandwidth usage.")
 	}
 
-	subscriptionMsg := []byte(`{"jsonrpc":"2.0","id":1,"method":"eth_subscribe","params":["logs",{"address":` + addressFilter + `,"topics":[[ "0xd78ad95fa46c994b6551d0da85fc275fe613ce37657fb8d5e3d130840159d822", "0xc42079f94a6350d7e6235f29174924f928cc2ac818eb64fed8004e115fbcca67" ]]}]}`)
+	// Build subscription request using proper JSON encoding.
+	topics := [][]string{
+		{
+			"0xd78ad95fa46c994b6551d0da85fc275fe613ce37657fb8d5e3d130840159d822",
+			"0xc42079f94a6350d7e6235f29174924f928cc2ac818eb64fed8004e115fbcca67",
+		},
+	}
+	filter := map[string]interface{}{
+		"topics": topics,
+	}
+	if len(validAddresses) > 0 {
+		filter["address"] = validAddresses
+	}
+
+	subParams := []interface{}{"logs", filter}
+	subReq := map[string]interface{}{
+		"jsonrpc": "2.0",
+		"id":      1,
+		"method":  "eth_subscribe",
+		"params":  subParams,
+	}
+	subscriptionMsg, err := json.Marshal(subReq)
+	if err != nil {
+		log.Fatalf("[WebSocket] Failed to marshal subscription request: %v", err)
+	}
 
 	dialer := newLowLatencyDialer()
 	var backoff time.Duration
@@ -204,7 +212,7 @@ func StartWebSocketReader(
 
 		log.Println("[WebSocket] Connected and subscribed to Swap events.")
 
-		// --- SEND CONNECTED STATUS ---
+		// Send connected status.
 		if statusChan != nil {
 			select {
 			case statusChan <- "connected":
@@ -220,7 +228,7 @@ func StartWebSocketReader(
 		stopPing()
 		conn.Close()
 
-		// --- SEND DISCONNECTED STATUS ---
+		// Send disconnected status.
 		if statusChan != nil {
 			select {
 			case statusChan <- "disconnected":
