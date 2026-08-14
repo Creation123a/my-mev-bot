@@ -163,7 +163,7 @@ func main() {
 		stateCache.SetCode(cfg.ExecutorAddress, executorCode)
 	}
 	// Warm up core pools (anchors) by fetching their code.
-	for _, poolAddr := range anchors {
+	//for _, poolAddr := range anchors {
 		// We don't have a direct list of pool addresses; we'll fetch from matrix preload later.
 		// For now, we can fetch code for known pools if we had them.
 		// We'll rely on lazy fetching in SimulateNative or add a list.
