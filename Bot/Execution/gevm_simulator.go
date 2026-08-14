@@ -20,7 +20,7 @@ import (
 	"github.com/ethereum/go-ethereum/common/hexutil"
 	"github.com/ethereum/go-ethereum/core"
 	"github.com/ethereum/go-ethereum/core/rawdb"
-	"github.com/ethereum/go-ethereum/core/state"
+	gethstate "github.com/ethereum/go-ethereum/core/state"
 	"github.com/ethereum/go-ethereum/core/vm"
 	"github.com/ethereum/go-ethereum/ethclient"
 	"github.com/ethereum/go-ethereum/ethdb"
@@ -28,7 +28,7 @@ import (
 	"github.com/ethereum/go-ethereum/trie"
 	"github.com/holiman/uint256"
 
-	"my-mev-bot/Bot/State"
+	botstate "my-mev-bot/Bot/State"
 	"my-mev-bot/Bot/Types"
 )
 
@@ -135,7 +135,7 @@ type GEVMSimulator struct {
 
 	// Native EVM state (in‑memory, zero‑latency).
 	nativeDB    ethdb.Database
-	nativeState *state.StateDB
+	nativeState *gethstate.StateDB
 	blockCtx    vm.BlockContext
 	txCtx       vm.TxContext
 	chainConfig *params.ChainConfig
@@ -145,7 +145,7 @@ type GEVMSimulator struct {
 	cache *StateCache
 
 	// Matrix reference for fresh state injection.
-	matrix *state.Matrix
+	matrix *botstate.Matrix
 
 	// Background updater control.
 	updaterCtx    context.Context
@@ -163,8 +163,8 @@ func NewGEVMSimulator(rpcURL string, owner common.Address, anvilURL string) *GEV
 
 	// Initialise native in‑memory EVM state.
 	memDB := rawdb.NewMemoryDatabase()
-	trieDB := trie.NewDatabase(memDB) // v1.13.15: only one parameter
-	stateDB, err := state.New(common.Hash{}, trieDB, nil) // v1.13.15: three parameters
+	trieDB := trie.NewDatabase(memDB)
+	stateDB, err := gethstate.New(common.Hash{}, trieDB, nil)
 	if err != nil {
 		panic(fmt.Sprintf("failed to init native state: %v", err))
 	}
@@ -209,7 +209,7 @@ func NewGEVMSimulator(rpcURL string, owner common.Address, anvilURL string) *GEV
 }
 
 // SetMatrix sets the state matrix used for fresh state injection.
-func (g *GEVMSimulator) SetMatrix(matrix *state.Matrix) {
+func (g *GEVMSimulator) SetMatrix(matrix *botstate.Matrix) {
 	g.matrix = matrix
 }
 
@@ -411,7 +411,7 @@ func (g *GEVMSimulator) UpdateBlockContext(ctx context.Context) error {
 }
 
 // injectPoolState writes the current pool state from the matrix into the StateDB.
-func (g *GEVMSimulator) injectPoolState(stateDB *state.StateDB, pool *types.PoolState) {
+func (g *GEVMSimulator) injectPoolState(stateDB *gethstate.StateDB, pool *types.PoolState) {
 	if pool == nil {
 		return
 	}
@@ -484,8 +484,8 @@ func (g *GEVMSimulator) SimulateNative(
 	g.evmMu.Lock()
 	// Create a fresh state for this simulation to avoid contaminating the base state.
 	root := g.nativeState.IntermediateRoot(false)
-	trieDB := trie.NewDatabase(g.nativeDB) // v1.13.15: one param
-	newState, err := state.New(root, trieDB, nil) // v1.13.15: three params
+	trieDB := trie.NewDatabase(g.nativeDB)
+	newState, err := gethstate.New(root, trieDB, nil)
 	if err != nil {
 		g.evmMu.Unlock()
 		return false, 0, fmt.Errorf("failed to copy state: %w", err)
@@ -527,7 +527,7 @@ func (g *GEVMSimulator) SimulateNative(
 		payload.TargetExecutor,
 		payload.Calldata,
 		payload.GasLimit,
-		uint256.NewInt(0), // v1.13.15: use *uint256.Int
+		uint256.NewInt(0),
 	)
 	gasUsed := payload.GasLimit - leftOverGas
 
@@ -561,7 +561,6 @@ func (g *GEVMSimulator) SimulateWithBackend(
 ) (bool, uint64, error) {
 	switch backend {
 	case SimBackendLocal:
-		// For local, use SimulateNative with matrix injection.
 		return g.SimulateNative(payload)
 	case SimBackendAnvil:
 		return g.simulateAnvil(payload)
@@ -586,12 +585,10 @@ func (g *GEVMSimulator) simulateRemote(payload *types.ExecutionPayload) (bool, u
 	}
 
 	targetURL := g.rpcURL
-	// 1. eth_call.
 	success, _, err := g.doEthCall(targetURL, payload)
 	if err != nil || !success {
 		return success, 0, err
 	}
-	// 2. eth_estimateGas.
 	gasUsed, err := g.estimateGas(targetURL, payload)
 	if err != nil {
 		return true, 0, fmt.Errorf("gas estimation failed: %w", err)
@@ -607,7 +604,6 @@ func (g *GEVMSimulator) simulateAnvil(payload *types.ExecutionPayload) (bool, ui
 	if !g.IsAnvilHealthy() {
 		return g.simulateRemote(payload)
 	}
-	// Acquire Anvil token.
 	select {
 	case g.anvilSem <- struct{}{}:
 		defer func() { <-g.anvilSem }()
