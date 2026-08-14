@@ -134,18 +134,23 @@ func StartWebSocketReader(
 		log.Println("[WebSocket] WARNING: No pool addresses configured; subscribing to ALL swap events. This may cause high bandwidth usage.")
 	}
 
-	// Build subscription request using proper JSON encoding.
-	topics := [][]string{
-		{
+	// Build topics filter: OR of both event signatures.
+	topics := []interface{}{
+		[]string{
 			"0xd78ad95fa46c994b6551d0da85fc275fe613ce37657fb8d5e3d130840159d822",
 			"0xc42079f94a6350d7e6235f29174924f928cc2ac818eb64fed8004e115fbcca67",
 		},
 	}
+
+	// Build filter object.
 	filter := map[string]interface{}{
 		"topics": topics,
 	}
 	if len(validAddresses) > 0 {
 		filter["address"] = validAddresses
+	} else {
+		// Some nodes require the field to exist; use empty array.
+		filter["address"] = []string{}
 	}
 
 	subParams := []interface{}{"logs", filter}
@@ -159,6 +164,9 @@ func StartWebSocketReader(
 	if err != nil {
 		log.Fatalf("[WebSocket] Failed to marshal subscription request: %v", err)
 	}
+	// Log the request for debugging.
+	log.Printf("[WebSocket] Subscription request: %s", string(subscriptionMsg))
+	
 
 	dialer := newLowLatencyDialer()
 	var backoff time.Duration
