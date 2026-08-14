@@ -162,11 +162,16 @@ func main() {
 	} else {
 		stateCache.SetCode(cfg.ExecutorAddress, executorCode)
 	}
-	// Warm up core pools (anchors) by fetching their code.
-	//for _, poolAddr := range anchors {
-		// We don't have a direct list of pool addresses; we'll fetch from matrix preload later.
-		// For now, we can fetch code for known pools if we had them.
-		// We'll rely on lazy fetching in SimulateNative or add a list.
+	// Warm up core pools by fetching their code into the state cache.
+poolsMap := matrix.GetPools()
+for _, pool := range poolsMap {
+    code, err := ethClient.CodeAt(ctx, pool.PoolAddress, nil)
+    if err != nil {
+        log.Printf("Warning: failed to fetch code for pool %s: %v", pool.PoolAddress.Hex(), err)
+        continue
+    }
+    stateCache.SetCode(pool.PoolAddress, code)
+}
 	}
 	gevm.SetStateCache(stateCache)
 
