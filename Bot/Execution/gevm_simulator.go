@@ -163,8 +163,10 @@ func NewGEVMSimulator(rpcURL string, owner common.Address, anvilURL string) *GEV
 
 	// Initialise native in‑memory EVM state.
 	memDB := rawdb.NewMemoryDatabase()
-	trieDB := triedb.NewDatabase(memDB,nil) // Correct API for v1.13.15
-	stateDB, err := gethstate.New(common.Hash{}, trieDB, nil)
+	triedbDB := triedb.NewDatabase(memDB, nil)
+	stateDB := gethstate.NewDatabaseWithNodeDB(memDB, triedbDB)
+
+	rootState, err := gethstate.New(common.Hash{}, stateDB, nil)
 	if err != nil {
 		panic(fmt.Sprintf("failed to init native state: %v", err))
 	}
@@ -200,7 +202,7 @@ func NewGEVMSimulator(rpcURL string, owner common.Address, anvilURL string) *GEV
 		remoteSem:    make(chan struct{}, 8),
 		anvilSem:     make(chan struct{}, 4),
 		nativeDB:     memDB,
-		nativeState:  stateDB,
+		nativeState:  rootState,
 		blockCtx:     blockCtx,
 		txCtx:        txCtx,
 		chainConfig:  chainCfg,
@@ -484,8 +486,10 @@ func (g *GEVMSimulator) SimulateNative(
 	g.evmMu.Lock()
 	// Create a fresh state for this simulation to avoid contaminating the base state.
 	root := g.nativeState.IntermediateRoot(false)
-	trieDB := triedb.NewDatabase(g.nativeDB,nil)// Correct API for v1.13.15
-	newState, err := gethstate.New(root, trieDB, nil)
+	triedbDB := triedb.NewDatabase(g.nativeDB, nil)
+	stateDB := gethstate.NewDatabaseWithNodeDB(g.nativeDB, triedbDB)
+
+	newState, err := gethstate.New(root, stateDB, nil)
 	if err != nil {
 		g.evmMu.Unlock()
 		return false, 0, fmt.Errorf("failed to copy state: %w", err)
