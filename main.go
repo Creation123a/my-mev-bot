@@ -172,7 +172,7 @@ for _, pool := range poolsMap {
     }
     stateCache.SetCode(pool.PoolAddress, code)
 }
-	}
+	
 	gevm.SetStateCache(stateCache)
 
 	// Optionally, update block context once to avoid first stale block.
