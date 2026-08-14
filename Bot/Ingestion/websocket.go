@@ -52,8 +52,9 @@ var knownPoolAddresses = []string{
 	// ---------- Aerodrome V2 ----------
 	"0xcF77a3Ba9A5CA399B7c97c74d54e5b1Beb874E43", // WETH/USDC
 	"0xB69c5339CD8993fa2B1a129033324fE45307b22d", // WETH/USDbC
-	"0x2A9A3fe6B1a798fB4a4f8990d0b04aFdE68A8b2a2", // WETH/cbBTC
-	"0x83B3a5BfD5Cd5fDCD40fBD58E783307559eED3E63", // USDC/cbBTC
+	"0x2578365b3dfa7ffe60108e181efb79feddec2319", // WETH/cbBTC (42 chars)
+"0x4e962bb3889bf030368f56810a9c96b83cb3e778", // USDC/cbBTC (42 chars)
+
 	"0x89D916B87Fa6bA90dcbA90dcbA90606B4b3F47Df", // USDbC/cbBTC
 	// USDC/USDbC stable pool address is a placeholder and omitted.
 
