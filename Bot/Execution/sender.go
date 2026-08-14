@@ -222,7 +222,7 @@ func (s *Sender) SendRawTransaction(payload *types.ExecutionPayload) (common.Has
 	}
 
 	failedPool := common.Address{}
-	var originalCandidate *types.RouteCandidate
+	//var originalCandidate *types.RouteCandidate
 	if len(payload.RoutePools) > 0 {
 		failedPool = payload.RoutePools[0]
 	}
