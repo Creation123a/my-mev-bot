@@ -25,7 +25,7 @@ import (
 	"github.com/ethereum/go-ethereum/ethclient"
 	"github.com/ethereum/go-ethereum/ethdb"
 	"github.com/ethereum/go-ethereum/params"
-	"github.com/ethereum/go-ethereum/triedb"
+	"github.com/ethereum/go-ethereum/trie"
 	"github.com/holiman/uint256"
 
 	botstate "my-mev-bot/Bot/State"
@@ -163,7 +163,7 @@ func NewGEVMSimulator(rpcURL string, owner common.Address, anvilURL string) *GEV
 
 	// Initialise native in‑memory EVM state.
 	memDB := rawdb.NewMemoryDatabase()
-	trieDB := triedb.NewDatabase(memDB,nil)
+	trieDB := trie.NewDatabase(memDB) // Correct API for v1.13.15
 	stateDB, err := gethstate.New(common.Hash{}, trieDB, nil)
 	if err != nil {
 		panic(fmt.Sprintf("failed to init native state: %v", err))
@@ -484,7 +484,7 @@ func (g *GEVMSimulator) SimulateNative(
 	g.evmMu.Lock()
 	// Create a fresh state for this simulation to avoid contaminating the base state.
 	root := g.nativeState.IntermediateRoot(false)
-	trieDB := triedb.NewDatabase(g.nativeDB,nil)
+	trieDB := trie.NewDatabase(g.nativeDB) // Correct API for v1.13.15
 	newState, err := gethstate.New(root, trieDB, nil)
 	if err != nil {
 		g.evmMu.Unlock()
