@@ -9,9 +9,12 @@ import (
 	"log"
 	"math"
 	"math/big"
+	"strings"
 	"sync"
 	"time"
 
+	"github.com/ethereum/go-ethereum/accounts/abi"
+	"github.com/ethereum/go-ethereum/accounts/abi/bind"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/ethclient"
 
@@ -139,6 +142,20 @@ func (gk *Gatekeeper) worker() {
 			log.Printf("[Gatekeeper] DEX factory promoted: %s", factoryAddr.Hex())
 		}
 
+		// ---- Determine DexType and register pool ----
+		var dexType types.DexType
+		if gk.isV3Pool(ctx, cand.PoolAddress) {
+			dexType = types.DexUniswapV3
+		} else {
+			dexType = types.DexAerodromeV2 // V2 pools use Aerodrome interface (same for AlienBase)
+		}
+
+		// Register the pool in the matrix with correct DexType.
+		if err := gk.registerPool(ctx, cand, dexType); err != nil {
+			log.Printf("[Gatekeeper] Failed to register pool %s: %v", cand.PoolAddress.Hex(), err)
+			continue
+		}
+
 		// 5. Qualify each token.
 		gk.qualifyTokenLayer(cand.Token0, cand.Token1, cand.PoolAddress)
 		gk.qualifyTokenLayer(cand.Token1, cand.Token0, cand.PoolAddress)
@@ -204,6 +221,112 @@ func (gk *Gatekeeper) getFactory(ctx context.Context, pool common.Address) (comm
 // callFactory performs the actual RPC to get the factory.
 func (gk *Gatekeeper) callFactory(ctx context.Context, pool common.Address) (common.Address, error) {
 	return gk.matrix.CallFactory(ctx, pool)
+}
+
+// isV3Pool checks if a pool has a fee() function (indicating Uniswap V3 style).
+func (gk *Gatekeeper) isV3Pool(ctx context.Context, pool common.Address) bool {
+	const feeABI = `[{"type":"function","name":"fee","inputs":[],"outputs":[{"type":"uint24"}]}]`
+	parsed, _ := abi.JSON(strings.NewReader(feeABI))
+	contract := bind.NewBoundContract(pool, parsed, gk.client, gk.client, gk.client)
+	var out []interface{}
+	// If this call succeeds, it's V3; if it fails, it's V2.
+	err := contract.Call(&bind.CallOpts{Context: ctx}, &out, "fee")
+	return err == nil
+}
+
+// registerPool fetches pool details and registers it in the matrix with the given DexType.
+func (gk *Gatekeeper) registerPool(ctx context.Context, cand DiscoveryCandidate, dexType types.DexType) error {
+	// Fetch token0 and token1.
+	t0, t1, err := gk.fetchPoolTokens(ctx, cand.PoolAddress)
+	if err != nil {
+		return fmt.Errorf("fetch tokens: %w", err)
+	}
+
+	poolState := &types.PoolState{
+		PoolAddress: cand.PoolAddress,
+		Token0:      t0,
+		Token1:      t1,
+		DexType:     dexType,
+	}
+
+	// For V3, fetch fee; for V2, default to 30 bps.
+	if dexType == types.DexUniswapV3 || dexType == types.DexPancakeV3 {
+		feeBps, err := gk.fetchPoolFee(ctx, cand.PoolAddress)
+		if err != nil {
+			poolState.FeeBps = 30 // fallback
+		} else {
+			poolState.FeeBps = feeBps
+		}
+	} else {
+		poolState.FeeBps = 30 // default for V2
+	}
+
+	// For V2, also fetch reserves.
+	if dexType == types.DexAerodromeV2 || dexType == types.DexAlienBaseV2 {
+		r0, r1, err := gk.fetchPoolReserves(ctx, cand.PoolAddress)
+		if err == nil {
+			poolState.Reserve0 = r0
+			poolState.Reserve1 = r1
+			poolState.Reserve0Float = float64FromBig(r0)
+			poolState.Reserve1Float = float64FromBig(r1)
+		}
+	}
+
+	gk.matrix.RegisterPool(poolState)
+	return nil
+}
+
+// fetchPoolTokens returns token0 and token1 from a pool.
+func (gk *Gatekeeper) fetchPoolTokens(ctx context.Context, pool common.Address) (common.Address, common.Address, error) {
+	const tokenABI = `[{"type":"function","name":"token0","inputs":[],"outputs":[{"type":"address"}]}]`
+	parsed, _ := abi.JSON(strings.NewReader(tokenABI))
+	contract := bind.NewBoundContract(pool, parsed, gk.client, gk.client, gk.client)
+	var out []interface{}
+	if err := contract.Call(&bind.CallOpts{Context: ctx}, &out, "token0"); err != nil {
+		return common.Address{}, common.Address{}, err
+	}
+	token0 := out[0].(common.Address)
+
+	const token1ABI = `[{"type":"function","name":"token1","inputs":[],"outputs":[{"type":"address"}]}]`
+	parsed1, _ := abi.JSON(strings.NewReader(token1ABI))
+	contract1 := bind.NewBoundContract(pool, parsed1, gk.client, gk.client, gk.client)
+	var out1 []interface{}
+	if err := contract1.Call(&bind.CallOpts{Context: ctx}, &out1, "token1"); err != nil {
+		return common.Address{}, common.Address{}, err
+	}
+	token1 := out1[0].(common.Address)
+	return token0, token1, nil
+}
+
+// fetchPoolFee returns the fee tier (for V3 pools) in basis points.
+func (gk *Gatekeeper) fetchPoolFee(ctx context.Context, pool common.Address) (uint32, error) {
+	const feeABI = `[{"type":"function","name":"fee","inputs":[],"outputs":[{"type":"uint24"}]}]`
+	parsed, _ := abi.JSON(strings.NewReader(feeABI))
+	contract := bind.NewBoundContract(pool, parsed, gk.client, gk.client, gk.client)
+	var out []interface{}
+	if err := contract.Call(&bind.CallOpts{Context: ctx}, &out, "fee"); err != nil {
+		return 0, err
+	}
+	rawFee := out[0].(*big.Int)
+	if rawFee.Uint64() > 0xFFFFFF {
+		return 0, fmt.Errorf("fee out of range")
+	}
+	// Fee is in hundredths of basis points; convert to basis points.
+	return uint32(rawFee.Uint64() / 100), nil
+}
+
+// fetchPoolReserves fetches reserves for V2-style pools.
+func (gk *Gatekeeper) fetchPoolReserves(ctx context.Context, pool common.Address) (*big.Int, *big.Int, error) {
+	const reservesABI = `[{"type":"function","name":"getReserves","inputs":[],"outputs":[{"type":"uint112","name":"reserve0"},{"type":"uint112","name":"reserve1"},{"type":"uint32","name":"blockTimestampLast"}]}]`
+	parsed, _ := abi.JSON(strings.NewReader(reservesABI))
+	contract := bind.NewBoundContract(pool, parsed, gk.client, gk.client, gk.client)
+	var out []interface{}
+	if err := contract.Call(&bind.CallOpts{Context: ctx}, &out, "getReserves"); err != nil {
+		return nil, nil, err
+	}
+	r0 := out[0].(*big.Int)
+	r1 := out[1].(*big.Int)
+	return r0, r1, nil
 }
 
 // simulateTwoWaySwap runs a buy and sell simulation and returns net profit in USD.
