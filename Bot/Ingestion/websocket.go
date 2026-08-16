@@ -26,7 +26,7 @@ const (
 	socketReadBufferSize    = 65536
 	socketWriteBufferSize   = 65536
 	pingInterval            = 30 * time.Second
-	pongWait                = 60 * time.Second
+	pongWait                = 120 * time.Second // increased to 120s to reduce timeouts
 	minBackoff              = 250 * time.Millisecond
 	maxBackoff              = 30 * time.Second
 	minStableConnection     = 30 * time.Second
@@ -223,13 +223,14 @@ func readLoop(
 		default:
 		}
 
+		// Refresh read deadline BEFORE each read attempt to prevent timeouts.
+		if err := conn.SetReadDeadline(time.Now().Add(pongWait)); err != nil {
+			return fmt.Errorf("set read deadline: %w", err)
+		}
+
 		msgType, reader, err := conn.NextReader()
 		if err != nil {
 			return fmt.Errorf("next reader: %w", err)
-		}
-
-		if err := conn.SetReadDeadline(time.Now().Add(pongWait)); err != nil {
-			return fmt.Errorf("set read deadline: %w", err)
 		}
 
 		if msgType != websocket.TextMessage && msgType != websocket.BinaryMessage {
