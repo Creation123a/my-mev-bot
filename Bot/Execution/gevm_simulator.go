@@ -23,7 +23,7 @@ import (
 	"github.com/ethereum/go-ethereum/core"
 	"github.com/ethereum/go-ethereum/core/rawdb"
 	gethstate "github.com/ethereum/go-ethereum/core/state"
-	"github.com/ethereum/go-ethereum/core/types"
+	gethTypes "github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/core/vm"
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/ethclient"
@@ -206,7 +206,8 @@ func (g *GEVMSimulator) StartWebSocketContextUpdater(ctx context.Context) {
 		}
 		defer client.Close()
 
-		headers := make(chan *types.Header, 1)
+	
+		headers := make(chan *gethTypes.Header, 1)
 		sub, err := client.SubscribeNewHead(ctx, headers)
 		if err != nil {
 			log.Printf("[GEVM] Subscription failed: %v", err)
