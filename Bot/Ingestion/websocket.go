@@ -26,7 +26,7 @@ const (
 	socketReadBufferSize    = 65536
 	socketWriteBufferSize   = 65536
 	pingInterval            = 30 * time.Second
-	pongWait                = 120 * time.Second // increased to 120s to reduce timeouts
+	pongWait                = 120 * time.Second
 	minBackoff              = 250 * time.Millisecond
 	maxBackoff              = 30 * time.Second
 	minStableConnection     = 30 * time.Second
@@ -132,11 +132,26 @@ func StartWebSocketReader(
 			time.Sleep(backoff)
 			continue
 		}
+
+		var writeMu sync.Mutex
+
+		// Handle Pong frames from server to extend deadline.
 		conn.SetPongHandler(func(string) error {
 			return conn.SetReadDeadline(time.Now().Add(pongWait))
 		})
 
-		var writeMu sync.Mutex
+		// CRITICAL FIX: Handle server-initiated Ping frames by replying with Pong.
+		// This ensures the connection stays alive even if the server doesn't respond to our pings.
+		conn.SetPingHandler(func(appData string) error {
+			writeMu.Lock()
+			defer writeMu.Unlock()
+			// Send Pong back immediately.
+			if err := conn.WriteControl(websocket.PongMessage, []byte(appData), time.Now().Add(5*time.Second)); err != nil {
+				return err
+			}
+			// Extend read deadline because we received activity.
+			return conn.SetReadDeadline(time.Now().Add(pongWait))
+		})
 
 		pingCtx, stopPing := context.WithCancel(ctx)
 		go func() {
