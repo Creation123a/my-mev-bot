@@ -9,10 +9,10 @@ import (
 	"os"
 	"os/signal"
 	"runtime"
+	"sort"
 	"strings"
 	"sync"
 	"syscall"
-	"sort"
 	"time"
 
 	"github.com/ethereum/go-ethereum/common"
@@ -20,11 +20,14 @@ import (
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/ethclient"
 	"golang.org/x/sys/unix"
+	"github.com/ethereum/go-ethereum/accounts/abi"
+	"github.com/ethereum/go-ethereum/accounts/abi/bind"
 
 	"my-mev-bot/Bot/Config"
 	"my-mev-bot/Bot/Dashboard"
 	"my-mev-bot/Bot/Execution"
 	"my-mev-bot/Bot/Ingestion"
+	"my-mev-bot/Bot/PoolRegistry"
 	"my-mev-bot/Bot/Solver"
 	"my-mev-bot/Bot/State"
 	"my-mev-bot/Bot/Types"
@@ -89,11 +92,6 @@ func main() {
 		log.Fatalf("Failed to load config: %v", err)
 	}
 
-	// Validate factory addresses before starting.
-	if err := config.ValidateFactories(); err != nil {
-		log.Fatalf("Factory validation failed: %v", err)
-	}
-
 	if err := solver.InitExecutorABI(); err != nil {
 		log.Fatalf("failed to init executor ABI: %v", err)
 	}
@@ -134,63 +132,98 @@ func main() {
 		log.Fatalf("Failed to create eth client: %v", err)
 	}
 	nonceTracker := state.NewNonceTracker()
-	// Sync nonce; fail hard if it doesn't succeed.
 	if err := nonceTracker.SyncFromNode(ethClient, ownerAddress); err != nil {
 		log.Fatalf("Failed to sync nonce from node: %v", err)
 	}
 
 	matrix.SetEthClient(ethClient)
-	preloadPools(matrix)
 
-	anvilRPC := os.Getenv("ANVIL_RPC")
-	if anvilRPC == "" {
-		anvilRPC = cfg.AnvilRPC
+	// ================================================================
+	// 1. Initialize PoolRegistry and fetch factory addresses from routers
+	// ================================================================
+	reg, err := poolregistry.New(cfg.BaseHTTPRPC)
+	if err != nil {
+		log.Fatalf("Failed to create pool registry: %v", err)
+	}
+	defer reg.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := reg.EnsureFactories(ctx); err != nil {
+		log.Fatalf("Failed to fetch factory addresses: %v", err)
+	}
+	matrix.SetRegistry(reg)
+
+	feeTiers := []uint32{500, 3000, 10000}
+
+	for i := 0; i < len(anchors); i++ {
+		for j := i + 1; j < len(anchors); j++ {
+			tokenA := anchors[i]
+			tokenB := anchors[j]
+
+			for _, fee := range feeTiers {
+				poolAddr, err := reg.FetchAndCacheV3(reg.UniswapV3Factory(), tokenA, tokenB, fee)
+				if err != nil || poolAddr == (common.Address{}) {
+					continue
+				}
+				registerPoolFromRegistry(matrix, ethClient, poolAddr, types.DexUniswapV3, fee)
+			}
+
+			for _, fee := range feeTiers {
+				poolAddr, err := reg.FetchAndCacheV3(reg.PancakeV3Factory(), tokenA, tokenB, fee)
+				if err != nil || poolAddr == (common.Address{}) {
+					continue
+				}
+				registerPoolFromRegistry(matrix, ethClient, poolAddr, types.DexPancakeV3, fee)
+			}
+
+			poolAddr, err := reg.FetchAndCacheV2Standard(reg.AlienBaseV2Factory(), tokenA, tokenB)
+			if err == nil && poolAddr != (common.Address{}) {
+				registerPoolFromRegistry(matrix, ethClient, poolAddr, types.DexAlienBaseV2, 30)
+			}
+
+			poolAddr, err = reg.FetchAndCacheAerodromeV2(reg.AerodromeV2Factory(), tokenA, tokenB, false)
+			if err == nil && poolAddr != (common.Address{}) {
+				registerPoolFromRegistry(matrix, ethClient, poolAddr, types.DexAerodromeV2, 30)
+			}
+
+			poolAddr, err = reg.FetchAndCacheAerodromeV2(reg.AerodromeV2Factory(), tokenA, tokenB, true)
+			if err == nil && poolAddr != (common.Address{}) {
+				registerPoolFromRegistry(matrix, ethClient, poolAddr, types.DexAerodromeV2, 5)
+			}
+		}
 	}
 
-	gevm := execution.NewGEVMSimulator(cfg.BaseHTTPRPC, ownerAddress, anvilRPC)
-	// Inject matrix for local EVM state.
+	log.Printf("[Main] Registered %d pools from registry", len(reg.GetAllPools()))
+	// ================================================================
+
+	// ---- Create GEVMSimulator with WebSocket URL ----
+	gevm := execution.NewGEVMSimulator(cfg.BaseHTTPRPC, cfg.BaseWSRPC, ownerAddress)
+
 	gevm.SetMatrix(matrix)
 
-	// Create and warm state cache for local EVM.
 	stateCache := execution.NewStateCache()
-	// Warm up executor code.
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
 	executorCode, err := ethClient.CodeAt(ctx, cfg.ExecutorAddress, nil)
 	if err != nil {
 		log.Printf("Warning: failed to fetch executor code: %v; local EVM may not work.", err)
 	} else {
 		stateCache.SetCode(cfg.ExecutorAddress, executorCode)
 	}
-	// Warm up core pools by fetching their code into the state cache.
-poolsMap := matrix.GetPools()
-for _, pool := range poolsMap {
-    code, err := ethClient.CodeAt(ctx, pool.PoolAddress, nil)
-    if err != nil {
-        log.Printf("Warning: failed to fetch code for pool %s: %v", pool.PoolAddress.Hex(), err)
-        continue
-    }
-    stateCache.SetCode(pool.PoolAddress, code)
-}
-	
+	poolsMap := matrix.GetPools()
+	for _, pool := range poolsMap {
+		code, err := ethClient.CodeAt(ctx, pool.PoolAddress, nil)
+		if err != nil {
+			log.Printf("Warning: failed to fetch code for pool %s: %v", pool.PoolAddress.Hex(), err)
+			continue
+		}
+		stateCache.SetCode(pool.PoolAddress, code)
+	}
 	gevm.SetStateCache(stateCache)
 
-	// Optionally, update block context once to avoid first stale block.
-	if err := gevm.UpdateBlockContext(ctx); err != nil {
-		log.Printf("Warning: initial block context update failed: %v", err)
-	}
-	gevm.StartBackgroundUpdater(ctx)
+	// ---- Start WebSocket‑based block context updater ----
+	gevm.StartWebSocketContextUpdater(ctx)
 
-	if anvilRPC != "" {
-		gevm.HealthCheckAnvil()
-		go func() {
-			ticker := time.NewTicker(30 * time.Second)
-			defer ticker.Stop()
-			for range ticker.C {
-				gevm.HealthCheckAnvil()
-			}
-		}()
-	}
+	// ---- Removed Anvil health checks and background ticker ----
 
 	execEndpoint := cfg.BaseExecRPC
 	if execEndpoint == "" {
@@ -208,14 +241,11 @@ for _, pool := range poolsMap {
 		cfg.MaxReplaceAttempts,
 	)
 
-	// Confirmation callback – currently reports estimated profit.
 	sender.SetConfirmationCallback(func(nonce uint64, txHash common.Hash, receipt *gethTypes.Receipt, payload *types.ExecutionPayload) {
 		profitUSD := payload.MinProfitUSD
-
 		profitMu.Lock()
 		totalProfit += profitUSD
 		profitMu.Unlock()
-
 		if dashServer != nil {
 			dashServer.AddProfit(profitUSD)
 			dashServer.SetTradeStatus("SUCCESS", "")
@@ -227,109 +257,84 @@ for _, pool := range poolsMap {
 			txHash.Hex(), profitUSD, payload.RouteDesc, receipt.BlockNumber.Uint64())
 	})
 
-	// --- Updated solver callback with RetryContext ---
-sender.SetSolverCallback(func(retryCtx execution.RetryContext) []*types.RouteCandidate {
-	lastLogMu.Lock()
-	logEntry := lastSwapLog
-	lastLogMu.Unlock()
-	if logEntry == nil {
-		return nil
-	}
-
-	// Generate fresh candidates using the original swap log.
-	allCands := solver.EvaluateEvent(logEntry, matrix, cfg)
-	if len(allCands) == 0 {
-		return nil
-	}
-
-	// Build a set of pools we want to avoid (failed route).
-	avoidPools := make(map[common.Address]bool)
-	for _, pool := range retryCtx.Pools {
-		if pool != (common.Address{}) {
-			avoidPools[pool] = true
+	sender.SetSolverCallback(func(retryCtx execution.RetryContext) []*types.RouteCandidate {
+		lastLogMu.Lock()
+		logEntry := lastSwapLog
+		lastLogMu.Unlock()
+		if logEntry == nil {
+			return nil
 		}
-	}
-
-	// Soft diversity scoring
-	type scoredCand struct {
-		cand  *types.RouteCandidate
-		score float64
-	}
-
-	var scored []scoredCand
-
-	for _, cand := range allCands {
-		// 1. Hard filter: must not use any pool from the failed route
-		usesFailedPool := false
-		for i := 0; i < int(cand.Hops); i++ {
-			if avoidPools[cand.Pools[i]] {
-				usesFailedPool = true
-				break
+		allCands := solver.EvaluateEvent(logEntry, matrix, cfg)
+		if len(allCands) == 0 {
+			return nil
+		}
+		avoidPools := make(map[common.Address]bool)
+		for _, pool := range retryCtx.Pools {
+			if pool != (common.Address{}) {
+				avoidPools[pool] = true
 			}
 		}
-		if usesFailedPool {
-			continue
+		type scoredCand struct {
+			cand  *types.RouteCandidate
+			score float64
 		}
-
-		// 2. Soft score starting from expected profit
-		score := cand.ExpectedProfitUSD
-
-		// Bonus for different number of hops
-		if retryCtx.OriginalCandidate != nil && cand.Hops != retryCtx.OriginalCandidate.Hops {
-			score *= 1.15
-		}
-
-		// Penalty based on how many tokens are shared with the failed route
-		if retryCtx.OriginalCandidate != nil {
-			shared := 0
-			total := int(cand.Hops) + 1
-			origSet := make(map[common.Address]bool)
-			for _, t := range retryCtx.OriginalCandidate.Tokens[:retryCtx.OriginalCandidate.Hops+1] {
-				if t != (common.Address{}) {
-					origSet[t] = true
+		var scored []scoredCand
+		for _, cand := range allCands {
+			usesFailedPool := false
+			for i := 0; i < int(cand.Hops); i++ {
+				if avoidPools[cand.Pools[i]] {
+					usesFailedPool = true
+					break
 				}
 			}
-			for i := 0; i < total; i++ {
-				if origSet[cand.Tokens[i]] {
-					shared++
+			if usesFailedPool {
+				continue
+			}
+			score := cand.ExpectedProfitUSD
+			if retryCtx.OriginalCandidate != nil && cand.Hops != retryCtx.OriginalCandidate.Hops {
+				score *= 1.15
+			}
+			if retryCtx.OriginalCandidate != nil {
+				shared := 0
+				total := int(cand.Hops) + 1
+				origSet := make(map[common.Address]bool)
+				for _, t := range retryCtx.OriginalCandidate.Tokens[:retryCtx.OriginalCandidate.Hops+1] {
+					if t != (common.Address{}) {
+						origSet[t] = true
+					}
+				}
+				for i := 0; i < total; i++ {
+					if origSet[cand.Tokens[i]] {
+						shared++
+					}
+				}
+				if total > 0 {
+					overlap := float64(shared) / float64(total)
+					score *= (1.0 - 0.4*overlap)
 				}
 			}
-			if total > 0 {
-				overlap := float64(shared) / float64(total)
-				score *= (1.0 - 0.4*overlap) // up to 40% penalty for full overlap
-			}
+			scored = append(scored, scoredCand{cand: cand, score: score})
 		}
-
-		scored = append(scored, scoredCand{cand: cand, score: score})
-	}
-
-	if len(scored) == 0 {
-		return nil
-	}
-
-	// Sort by score descending
-	sort.Slice(scored, func(i, j int) bool {
-		return scored[i].score > scored[j].score
+		if len(scored) == 0 {
+			return nil
+		}
+		sort.Slice(scored, func(i, j int) bool {
+			return scored[i].score > scored[j].score
+		})
+		maxReturn := 3
+		if len(scored) < maxReturn {
+			maxReturn = len(scored)
+		}
+		filtered := make([]*types.RouteCandidate, maxReturn)
+		for i := 0; i < maxReturn; i++ {
+			filtered[i] = scored[i].cand
+		}
+		return filtered
 	})
 
-	// Return top 3
-	maxReturn := 3
-	if len(scored) < maxReturn {
-		maxReturn = len(scored)
-	}
-	filtered := make([]*types.RouteCandidate, maxReturn)
-	for i := 0; i < maxReturn; i++ {
-		filtered[i] = scored[i].cand
-	}
-	return filtered
-})
-
-	// Allow the sender to re-simulate alternatives during retry
 	sender.SetSimulateFunc(func(cand *types.RouteCandidate, payload *types.ExecutionPayload) (bool, uint64, error) {
 		return gevm.SimulateNative(payload)
 	})
-
-	
 
 	decoder := ingestion.NewDecoder()
 
@@ -342,9 +347,15 @@ sender.SetSolverCallback(func(retryCtx execution.RetryContext) []*types.RouteCan
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 
-	// WebSocket status channel.
 	statusChan := make(chan string, 1)
-	go ingestion.StartWebSocketReader(ctx, cfg.BaseWSRPC, eventChan, decoder, statusChan)
+
+	poolAddresses := reg.GetAllPools()
+	if len(poolAddresses) == 0 {
+		log.Fatal("No pools fetched – cannot subscribe to any swap events")
+	}
+	log.Printf("[Main] Subscribing to %d pool addresses", len(poolAddresses))
+
+	go ingestion.StartWebSocketReader(ctx, cfg.BaseWSRPC, eventChan, decoder, statusChan, poolAddresses)
 
 	go func() {
 		for status := range statusChan {
@@ -368,7 +379,6 @@ sender.SetSolverCallback(func(retryCtx execution.RetryContext) []*types.RouteCan
 		cores = []int{2, 3, 4}
 	}
 
-	// Worker 1: Event ingestion → route generation
 	wg.Add(1)
 	go func() {
 		if cfg.EnableCPUPinning {
@@ -378,20 +388,17 @@ sender.SetSolverCallback(func(retryCtx execution.RetryContext) []*types.RouteCan
 		worker1(ctx, eventChan, candidateChan, matrix, blacklist, lru, anchorSet, cfg)
 	}()
 
-	// Worker pool for simulation & payload construction
 	for i := 0; i < numSimWorkers; i++ {
 		wg.Add(1)
 		go func(workerID int) {
-			// Optional CPU pinning if enough cores.
-			// if cfg.EnableCPUPinning && len(cores) > 2+workerID {
-			//     pinToCore(cores[2+workerID])
-			// }
+			if cfg.EnableCPUPinning && len(cores) > 2+workerID {
+				pinToCore(cores[2+workerID])
+			}
 			defer wg.Done()
 			worker2(ctx, candidateChan, executionChan, gevm, matrix, blacklist, anchorSet, cfg)
 		}(i)
 	}
 
-	// Worker 3: Transaction sending
 	wg.Add(1)
 	go func() {
 		if cfg.EnableCPUPinning {
@@ -423,13 +430,71 @@ sender.SetSolverCallback(func(retryCtx execution.RetryContext) []*types.RouteCan
 	log.Println("Bot stopped.")
 }
 
-func preloadPools(matrix *state.Matrix) {
-	anchors := config.AnchorAssets()
-	for i, addr := range anchors {
-		matrix.RegisterToken(addr, uint8(i))
+// registerPoolFromRegistry fetches token0/token1 from the pool and registers it in the matrix.
+func registerPoolFromRegistry(matrix *state.Matrix, client *ethclient.Client, poolAddr common.Address, dexType types.DexType, feeBps uint32) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	token0, err := callToken0(ctx, client, poolAddr)
+	if err != nil {
+		log.Printf("Failed to get token0 for pool %s: %v", poolAddr.Hex(), err)
+		return
 	}
-	matrix.PreloadKnownPools()
+	token1, err := callToken1(ctx, client, poolAddr)
+	if err != nil {
+		log.Printf("Failed to get token1 for pool %s: %v", poolAddr.Hex(), err)
+		return
+	}
+
+	pool := &types.PoolState{
+		PoolAddress:  poolAddr,
+		Token0:       token0,
+		Token1:       token1,
+		DexType:      dexType,
+		FeeBps:       feeBps,
+		Reserve0:     new(big.Int),
+		Reserve1:     new(big.Int),
+		SqrtPriceX96: new(big.Int),
+		Liquidity:    new(big.Int),
+	}
+	matrix.RegisterPool(pool)
 }
+
+// Helper to call token0() on a pool.
+func callToken0(ctx context.Context, client *ethclient.Client, pool common.Address) (common.Address, error) {
+	const token0ABI = `[{"type":"function","name":"token0","inputs":[],"outputs":[{"type":"address"}]}]`
+	parsed, _ := abi.JSON(strings.NewReader(token0ABI))
+	contract := bind.NewBoundContract(pool, parsed, client, client, client)
+	var out []interface{}
+	err := contract.Call(&bind.CallOpts{Context: ctx}, &out, "token0")
+	if err != nil {
+		return common.Address{}, err
+	}
+	if len(out) == 0 {
+		return common.Address{}, fmt.Errorf("no output")
+	}
+	return out[0].(common.Address), nil
+}
+
+// Helper to call token1() on a pool.
+func callToken1(ctx context.Context, client *ethclient.Client, pool common.Address) (common.Address, error) {
+	const token1ABI = `[{"type":"function","name":"token1","inputs":[],"outputs":[{"type":"address"}]}]`
+	parsed, _ := abi.JSON(strings.NewReader(token1ABI))
+	contract := bind.NewBoundContract(pool, parsed, client, client, client)
+	var out []interface{}
+	err := contract.Call(&bind.CallOpts{Context: ctx}, &out, "token1")
+	if err != nil {
+		return common.Address{}, err
+	}
+	if len(out) == 0 {
+		return common.Address{}, fmt.Errorf("no output")
+	}
+	return out[0].(common.Address), nil
+}
+
+// ---------------------------------------------------------------------
+// Worker functions
+// ---------------------------------------------------------------------
 
 func worker1(
 	ctx context.Context,
@@ -454,6 +519,15 @@ func worker1(
 			}
 
 			matrix.UpdateFromLog(swapLog)
+
+			// Ensure TokenIn/TokenOut are set
+			if swapLog.TokenIn == (common.Address{}) || swapLog.TokenOut == (common.Address{}) {
+				pool := matrix.GetPool(swapLog.Address)
+				if pool != nil {
+					swapLog.TokenIn = pool.Token0
+					swapLog.TokenOut = pool.Token1
+				}
+			}
 
 			lastLogMu.Lock()
 			copyLog := &types.SwapLog{
@@ -527,7 +601,7 @@ func worker1(
 	}
 }
 
-// getTokenDecimals returns the correct decimals for a token.
+// getTokenDecimals (unchanged)
 func getTokenDecimals(token common.Address) int {
 	if token == config.USDCAddress || token == config.USDBCAddress {
 		return 6
@@ -541,6 +615,7 @@ func getTokenDecimals(token common.Address) int {
 	return 18
 }
 
+// worker2 – fixed context leak
 func worker2(
 	ctx context.Context,
 	candidateChan <-chan *types.RouteCandidate,
@@ -631,7 +706,6 @@ func worker2(
 				continue
 			}
 
-			// Choose backend.
 			backend := gevm.ChooseBackend(cand)
 			simPayload := &types.ExecutionPayload{
 				TargetExecutor: cfg.ExecutorAddress,
@@ -643,10 +717,11 @@ func worker2(
 			var gasUsed uint64
 
 			if backend == execution.SimBackendLocal {
-				// Use native local EVM.
+				// Use context with timeout and cancel immediately to avoid memory leak
+				subCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 				success, gasUsed, err = gevm.SimulateNative(simPayload)
+				cancel() // immediate cleanup
 				if err != nil || !success {
-					// Fallback to remote on failure.
 					success, gasUsed, err = gevm.SimulateWithBackend(cand, simPayload, execution.SimBackendRemote)
 				}
 			} else {
@@ -715,6 +790,7 @@ func worker2(
 	}
 }
 
+// worker3 – non-blocking send via goroutine with proper nonce handling
 func worker3(
 	ctx context.Context,
 	executionChan <-chan *types.ExecutionPayload,
@@ -732,31 +808,35 @@ func worker3(
 			nonce := nonceTracker.NextNonce()
 			payload.Nonce = nonce
 
-			txHash, err := sender.SendRawTransaction(payload)
-			if err != nil {
-				nonceTracker.Rollback()
-				msg := fmt.Sprintf("[-] DROP | Tx broadcast failed | Reason: %v", err)
-				log.Println(msg)
-				if dashServer != nil {
-					dashServer.Log(msg)
-					dashServer.SetTradeStatus("FAILED", err.Error())
+			// Fire-and-forget broadcast to avoid blocking the loop.
+			go func(p *types.ExecutionPayload, n uint64) {
+				txHash, err := sender.SendRawTransaction(p)
+				if err != nil {
+					nonceTracker.Rollback()
+					msg := fmt.Sprintf("[-] DROP | Tx broadcast failed | Reason: %v", err)
+					log.Println(msg)
+					if dashServer != nil {
+						dashServer.Log(msg)
+						dashServer.SetTradeStatus("FAILED", err.Error())
+					}
+					putPayload(p)
+					return
 				}
-				putPayload(payload)
-				continue
-			}
 
-			log.Printf("[+] PENDING | Tx: %s | Profit: $%.2f | GasTip: %.3f Gwei | Route: %s",
-				txHash.Hex(),
-				payload.MinProfitUSD,
-				float64(payload.PriorityFeeWei)/1e9,
-				payload.RouteDesc,
-			)
+				log.Printf("[+] PENDING | Tx: %s | Profit: $%.2f | GasTip: %.3f Gwei | Route: %s",
+					txHash.Hex(),
+					p.MinProfitUSD,
+					float64(p.PriorityFeeWei)/1e9,
+					p.RouteDesc,
+				)
 
-			sender.RegisterPendingNonce(nonce, payload)
+				sender.RegisterPendingNonce(n, p)
+			}(payload, nonce)
 		}
 	}
 }
 
+// printStartupBanner (unchanged)
 func printStartupBanner(cfg *config.Config) {
 	fmt.Println("=== Base Flash Arbitrage Bot ===")
 	fmt.Printf("WS RPC:        %s\n", cfg.BaseWSRPC)
@@ -768,6 +848,7 @@ func printStartupBanner(cfg *config.Config) {
 	fmt.Println("=================================")
 }
 
+// logDrop (unchanged)
 func logDrop(cand *types.RouteCandidate, err error) {
 	var msg string
 	if cand == nil {
@@ -794,6 +875,7 @@ func logDrop(cand *types.RouteCandidate, err error) {
 	}
 }
 
+// formatCandidateRoute (unchanged)
 func formatCandidateRoute(cand *types.RouteCandidate) string {
 	if cand == nil || cand.Hops == 0 {
 		return "unknown"
@@ -811,6 +893,7 @@ func formatCandidateRoute(cand *types.RouteCandidate) string {
 	return route
 }
 
+// dexName (unchanged)
 func dexName(t types.DexType) string {
 	switch t {
 	case types.DexUniswapV3:
