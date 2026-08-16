@@ -4,6 +4,7 @@ package poolregistry
 import (
 	"context"
 	"fmt"
+	"log"
 	"strings"
 	"sync"
 	"time"
@@ -13,7 +14,6 @@ import (
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/ethclient"
 )
-
 var (
 	UniswapV3Router   = common.HexToAddress("0x2626664c2603336E57B271c5C0b26F421741e481")
 	PancakeV3Router   = common.HexToAddress("0x1b81D678ffb9C0263b24A97847620C99d213eB14")
@@ -56,52 +56,64 @@ func sortTokens(a, b common.Address) (string, string) {
 	}
 	return bStr, aStr
 }
-
 func (pr *PoolRegistry) EnsureFactories(ctx context.Context) error {
-	pr.factoryMu.Lock()
-	defer pr.factoryMu.Unlock()
-	if pr.fetched {
-		return nil
-	}
+    pr.factoryMu.Lock()
+    defer pr.factoryMu.Unlock()
+    if pr.fetched {
+        return nil
+    }
 
-	// Dynamic standard signature
-	const factoryABI = `[{"inputs":[],"name":"factory","outputs":[{"internalType":"address","name":"","type":"address"}],"stateMutability":"view","type":"function"}]`
-	parsed, err := abi.JSON(strings.NewReader(factoryABI))
-	if err != nil {
-		return fmt.Errorf("parse factory ABI: %w", err)
-	}
+    // Standard factory method ABI (works for Uniswap V3, Pancake V3, AlienBase V2, and Aerodrome Slipstream)
+    const factoryABI = `[{"inputs":[],"name":"factory","outputs":[{"internalType":"address","name":"","type":"address"}],"stateMutability":"view","type":"function"}]`
+    parsed, err := abi.JSON(strings.NewReader(factoryABI))
+    if err != nil {
+        return fmt.Errorf("parse factory ABI: %w", err)
+    }
 
-	// Fixes Bug #1: Special signature required to read the unique Aerodrome architecture layout
-	const aerodromeRouterABI = `[{"inputs":[],"name":"factory0","outputs":[{"internalType":"address","name":"","type":"address"}],"stateMutability":"view","type":"function"}]`
-	parsedAero, err := abi.JSON(strings.NewReader(aerodromeRouterABI))
-	if err != nil {
-		return fmt.Errorf("parse aero factory ABI: %w", err)
-	}
+    fetchMethod := func(router common.Address, methodName string) (common.Address, error) {
+        contract := bind.NewBoundContract(router, parsed, pr.client, pr.client, pr.client)
+        var out []interface{}
+        subCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+        defer cancel()
+        err := contract.Call(&bind.CallOpts{Context: subCtx}, &out, methodName)
+        if err != nil {
+            return common.Address{}, err
+        }
+        if len(out) == 0 {
+            return common.Address{}, fmt.Errorf("empty response")
+        }
+        return out[0].(common.Address), nil
+    }
 
-	fetchMethod := func(router common.Address, abiObject abi.ABI, methodName string) (common.Address, error) {
-		contract := bind.NewBoundContract(router, abiObject, pr.client, pr.client, pr.client)
-		var out []interface{}
-		subCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
-		defer cancel()
-		err := contract.Call(&bind.CallOpts{Context: subCtx}, &out, methodName)
-		if err != nil {
-			return common.Address{}, err
-		}
-		if len(out) == 0 {
-			return common.Address{}, fmt.Errorf("empty response")
-		}
-		return out[0].(common.Address), nil
-	}
+    if addr, err := fetchMethod(UniswapV3Router, "factory"); err == nil {
+        pr.uniswapV3 = addr
+    } else {
+        return fmt.Errorf("uni v3 rpc drop: %w", err)
+    }
 
-	if addr, err := fetchMethod(UniswapV3Router, parsed, "factory"); err == nil { pr.uniswapV3 = addr } else { return fmt.Errorf("uni v3 rpc drop: %w", err) }
-	if addr, err := fetchMethod(PancakeV3Router, parsed, "factory"); err == nil { pr.pancakeV3 = addr } else { return fmt.Errorf("pancake v3 rpc drop: %w", err) }
-	if addr, err := fetchMethod(AlienBaseV2Router, parsed, "factory"); err == nil { pr.alienBaseV2 = addr } else { return fmt.Errorf("alienbase v2 rpc drop: %w", err) }
-	
-	// Aerodrome calls 'factory0' instead of standard 'factory'
-	if addr, err := fetchMethod(AerodromeV2Router, parsedAero, "factory0"); err == nil { pr.aerodromeV2 = addr } else { return fmt.Errorf("aerodrome v2 rpc drop: %w", err) }
+    if addr, err := fetchMethod(PancakeV3Router, "factory"); err == nil {
+        pr.pancakeV3 = addr
+    } else {
+        return fmt.Errorf("pancake v3 rpc drop: %w", err)
+    }
 
-	pr.fetched = true
-	return nil
+    if addr, err := fetchMethod(AlienBaseV2Router, "factory"); err == nil {
+        pr.alienBaseV2 = addr
+    } else {
+        return fmt.Errorf("alienbase v2 rpc drop: %w", err)
+    }
+
+    // Aerodrome Slipstream uses standard "factory" method
+    if addr, err := fetchMethod(AerodromeV2Router, "factory"); err == nil {
+        pr.aerodromeV2 = addr
+    } else {
+        // Fallback to known Aerodrome factory address if RPC fails
+        pr.aerodromeV2 = common.HexToAddress("0x420dd381b31aef6683db6b902084cb0ffece40da")
+        log.Printf("[PoolRegistry] Aerodrome factory fetch failed, using fallback address")
+    }
+
+    pr.fetched = true
+    return nil
 }
 
 func (pr *PoolRegistry) UniswapV3Factory() common.Address   { pr.factoryMu.RLock(); defer pr.factoryMu.RUnlock(); return pr.uniswapV3 }
