@@ -1,3 +1,5 @@
+// Package execution provides transaction simulation and execution.
+// It includes a local EVM for zero-latency simulations, with fallback to remote RPC.
 package execution
 
 import (
@@ -21,13 +23,16 @@ import (
 	"github.com/ethereum/go-ethereum/core"
 	"github.com/ethereum/go-ethereum/core/rawdb"
 	gethstate "github.com/ethereum/go-ethereum/core/state"
+	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/core/vm"
+	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/ethclient"
 	"github.com/ethereum/go-ethereum/ethdb"
 	"github.com/ethereum/go-ethereum/params"
 	"github.com/ethereum/go-ethereum/triedb"
 	"github.com/holiman/uint256"
 
+	"my-mev-bot/Bot/Config"
 	botstate "my-mev-bot/Bot/State"
 	"my-mev-bot/Bot/Types"
 )
@@ -36,11 +41,7 @@ import (
 type SimBackend string
 
 const (
-	// SimBackendLocal uses an in‑process native EVM (zero‑latency).
-	SimBackendLocal SimBackend = "local"
-	// SimBackendAnvil uses a local Anvil fork.
-	SimBackendAnvil SimBackend = "anvil"
-	// SimBackendRemote uses a remote eth_call RPC.
+	SimBackendLocal  SimBackend = "local"
 	SimBackendRemote SimBackend = "remote"
 )
 
@@ -68,7 +69,7 @@ func init() {
 	revertABI = &parsed
 }
 
-// StateCache holds only contract bytecode (storage is now injected from matrix).
+// StateCache holds contract bytecode; storage is injected from the matrix.
 type StateCache struct {
 	code map[common.Address][]byte
 	mu   sync.RWMutex
@@ -80,14 +81,12 @@ func NewStateCache() *StateCache {
 	}
 }
 
-// SetCode stores contract bytecode.
 func (c *StateCache) SetCode(addr common.Address, code []byte) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.code[addr] = code
 }
 
-// GetCode retrieves contract bytecode.
 func (c *StateCache) GetCode(addr common.Address) ([]byte, bool) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
@@ -96,18 +95,13 @@ func (c *StateCache) GetCode(addr common.Address) ([]byte, bool) {
 }
 
 // WarmUp pre‑loads code for known pools and the executor contract.
-// This must be called at startup before using the local EVM backend.
 func (c *StateCache) WarmUp(executor common.Address, pools []common.Address, client *ethclient.Client) error {
 	ctx := context.Background()
-
-	// Fetch executor code.
 	code, err := client.CodeAt(ctx, executor, nil)
 	if err != nil {
 		return fmt.Errorf("failed to get executor code: %w", err)
 	}
 	c.SetCode(executor, code)
-
-	// For each pool, fetch code only (storage is injected from matrix later).
 	for _, pool := range pools {
 		code, err := client.CodeAt(ctx, pool, nil)
 		if err != nil {
@@ -118,33 +112,22 @@ func (c *StateCache) WarmUp(executor common.Address, pools []common.Address, cli
 	return nil
 }
 
-// GEVMSimulator provides remote, Anvil, and native in‑process EVM simulation.
+// GEVMSimulator provides remote and native in‑process EVM simulation.
 type GEVMSimulator struct {
 	httpClient *http.Client
 	rpcURL     string
+	wsURL      string
 	owner      common.Address
 
-	// Anvil settings – protected by healthMu.
-	anvilRPCURL  string
-	anvilHealthy bool
-	healthMu     sync.RWMutex
-
-	// Concurrency control for remote and anvil simulations.
 	remoteSem chan struct{}
-	anvilSem  chan struct{}
 
-	// Native EVM state (in‑memory, zero‑latency).
-	nativeDB    ethdb.Database
-	nativeState *gethstate.StateDB
+	// Native EVM state – protected by evmMu.
+	evmMu       sync.RWMutex
 	blockCtx    vm.BlockContext
 	txCtx       vm.TxContext
 	chainConfig *params.ChainConfig
-	evmMu       sync.RWMutex
 
-	// State cache for fast code injection.
-	cache *StateCache
-
-	// Matrix reference for fresh state injection.
+	cache  *StateCache
 	matrix *botstate.Matrix
 
 	// Background updater control.
@@ -152,8 +135,9 @@ type GEVMSimulator struct {
 	updaterCancel context.CancelFunc
 }
 
-// NewGEVMSimulator creates a simulator with remote RPC, Anvil, and native EVM backends.
-func NewGEVMSimulator(rpcURL string, owner common.Address, anvilURL string) *GEVMSimulator {
+// NewGEVMSimulator creates a simulator with remote RPC and local EVM backends.
+// wsURL is the WebSocket endpoint for real‑time block header updates.
+func NewGEVMSimulator(rpcURL, wsURL string, owner common.Address) *GEVMSimulator {
 	transport := &http.Transport{
 		MaxIdleConns:        10,
 		MaxIdleConnsPerHost: 10,
@@ -161,20 +145,8 @@ func NewGEVMSimulator(rpcURL string, owner common.Address, anvilURL string) *GEV
 		DisableKeepAlives:   false,
 	}
 
-	// Initialise native in‑memory EVM state.
-	memDB := rawdb.NewMemoryDatabase()
-	triedbDB := triedb.NewDatabase(memDB, nil)
-	stateDB := gethstate.NewDatabaseWithNodeDB(memDB, triedbDB)
-
-	rootState, err := gethstate.New(common.Hash{}, stateDB, nil)
-	if err != nil {
-		panic(fmt.Sprintf("failed to init native state: %v", err))
-	}
-
-	// Use MainnetChainConfig as a baseline; Base is EVM-compatible.
 	chainCfg := params.MainnetChainConfig
 
-	// Default block context (will be updated via RPC).
 	blockCtx := vm.BlockContext{
 		CanTransfer: core.CanTransfer,
 		Transfer:    core.Transfer,
@@ -193,20 +165,16 @@ func NewGEVMSimulator(rpcURL string, owner common.Address, anvilURL string) *GEV
 	return &GEVMSimulator{
 		httpClient: &http.Client{
 			Transport: transport,
-			Timeout:   5 * time.Second,
+			Timeout:   10 * time.Second,
 		},
-		rpcURL:       rpcURL,
-		owner:        owner,
-		anvilRPCURL:  anvilURL,
-		anvilHealthy: false,
-		remoteSem:    make(chan struct{}, 8),
-		anvilSem:     make(chan struct{}, 4),
-		nativeDB:     memDB,
-		nativeState:  rootState,
-		blockCtx:     blockCtx,
-		txCtx:        txCtx,
-		chainConfig:  chainCfg,
-		cache:        NewStateCache(),
+		rpcURL:      rpcURL,
+		wsURL:       wsURL,
+		owner:       owner,
+		remoteSem:   make(chan struct{}, 8),
+		blockCtx:    blockCtx,
+		txCtx:       txCtx,
+		chainConfig: chainCfg,
+		cache:       NewStateCache(),
 	}
 }
 
@@ -215,39 +183,58 @@ func (g *GEVMSimulator) SetMatrix(matrix *botstate.Matrix) {
 	g.matrix = matrix
 }
 
-// SetStateCache sets a custom state cache (useful for sharing cache across instances).
+// SetStateCache sets a custom state cache.
 func (g *GEVMSimulator) SetStateCache(cache *StateCache) {
 	g.cache = cache
 }
 
-// StartBackgroundUpdater starts a goroutine that periodically updates the block context
-// from the RPC. This ensures the local EVM uses current block parameters.
-// Call this after the simulator is created and before using SimulateNative.
-func (g *GEVMSimulator) StartBackgroundUpdater(ctx context.Context) {
+// StartWebSocketContextUpdater subscribes to new block headers via WebSocket
+// and updates the local block context in real time.
+func (g *GEVMSimulator) StartWebSocketContextUpdater(ctx context.Context) {
 	if g.updaterCtx != nil {
-		return // already running
+		return
 	}
 	updaterCtx, cancel := context.WithCancel(ctx)
 	g.updaterCtx = updaterCtx
 	g.updaterCancel = cancel
 
 	go func() {
-		ticker := time.NewTicker(2 * time.Second)
-		defer ticker.Stop()
+		client, err := ethclient.Dial(g.wsURL)
+		if err != nil {
+			log.Printf("[GEVM] WebSocket dial failed: %v", err)
+			return
+		}
+		defer client.Close()
+
+		headers := make(chan *types.Header, 1)
+		sub, err := client.SubscribeNewHead(ctx, headers)
+		if err != nil {
+			log.Printf("[GEVM] Subscription failed: %v", err)
+			return
+		}
+		defer sub.Unsubscribe()
+
 		for {
 			select {
 			case <-updaterCtx.Done():
 				return
-			case <-ticker.C:
-				if err := g.UpdateBlockContext(updaterCtx); err != nil {
-					log.Printf("[GEVM] Warning: failed to update block context: %v\n", err)
-				}
+			case err := <-sub.Err():
+				log.Printf("[GEVM] Subscription error: %v", err)
+				return
+			case head := <-headers:
+				g.evmMu.Lock()
+				g.blockCtx.BlockNumber = head.Number
+				g.blockCtx.Time = head.Time
+				g.blockCtx.BaseFee = head.BaseFee
+				g.blockCtx.GasLimit = head.GasLimit
+				g.txCtx.GasPrice = new(big.Int).Add(head.BaseFee, big.NewInt(1e9))
+				g.evmMu.Unlock()
 			}
 		}
 	}()
 }
 
-// StopBackgroundUpdater stops the background updater goroutine.
+// StopBackgroundUpdater stops the updater.
 func (g *GEVMSimulator) StopBackgroundUpdater() {
 	if g.updaterCancel != nil {
 		g.updaterCancel()
@@ -256,226 +243,80 @@ func (g *GEVMSimulator) StopBackgroundUpdater() {
 	}
 }
 
-// SetAnvilURL allows setting or updating the Anvil URL.
-func (g *GEVMSimulator) SetAnvilURL(url string) {
-	g.healthMu.Lock()
-	defer g.healthMu.Unlock()
-	g.anvilRPCURL = url
-}
-
-func (g *GEVMSimulator) getAnvilURL() string {
-	g.healthMu.RLock()
-	defer g.healthMu.RUnlock()
-	return g.anvilRPCURL
-}
-
-// IsAnvilHealthy returns true if the Anvil fork is responsive.
-func (g *GEVMSimulator) IsAnvilHealthy() bool {
-	g.healthMu.RLock()
-	defer g.healthMu.RUnlock()
-	return g.anvilHealthy && g.anvilRPCURL != ""
-}
-
-// HealthCheckAnvil pings the Anvil endpoint.
-func (g *GEVMSimulator) HealthCheckAnvil() {
-	url := g.getAnvilURL()
-	if url == "" {
-		g.healthMu.Lock()
-		g.anvilHealthy = false
-		g.healthMu.Unlock()
-		return
-	}
-	reqBody := map[string]interface{}{
-		"jsonrpc": "2.0",
-		"method":  "eth_blockNumber",
-		"params":  []interface{}{},
-		"id":      1,
-	}
-	reqJSON, _ := json.Marshal(reqBody)
-	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
-	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(reqJSON))
-	if err != nil {
-		g.healthMu.Lock()
-		g.anvilHealthy = false
-		g.healthMu.Unlock()
-		return
-	}
-	req.Header.Set("Content-Type", "application/json")
-	resp, err := g.httpClient.Do(req)
-	if err != nil {
-		g.healthMu.Lock()
-		g.anvilHealthy = false
-		g.healthMu.Unlock()
-		return
-	}
-	defer resp.Body.Close()
-	body, _ := io.ReadAll(resp.Body)
-	var rpcResp struct {
-		Result string `json:"result"`
-	}
-	if err := json.Unmarshal(body, &rpcResp); err != nil {
-		g.healthMu.Lock()
-		g.anvilHealthy = false
-		g.healthMu.Unlock()
-		return
-	}
-	g.healthMu.Lock()
-	g.anvilHealthy = len(rpcResp.Result) > 0
-	g.healthMu.Unlock()
-}
-
-// ChooseBackend selects the simulation backend based on candidate properties.
-// Prefers local EVM if matrix is available and the route pools are known.
+// ChooseBackend selects the simulation backend.
 func (g *GEVMSimulator) ChooseBackend(cand *types.RouteCandidate) SimBackend {
 	if g.matrix != nil && len(cand.Pools) > 0 {
-		// Check that all pools in the route exist in the matrix.
-		allKnown := true
 		for _, poolAddr := range cand.Pools[:cand.Hops] {
-			if poolAddr == (common.Address{}) {
-				allKnown = false
-				break
-			}
-			if g.matrix.GetPool(poolAddr) == nil {
-				allKnown = false
-				break
+			if poolAddr == (common.Address{}) || g.matrix.GetPool(poolAddr) == nil {
+				return SimBackendRemote
 			}
 		}
-		if allKnown {
-			return SimBackendLocal
-		}
-	}
-	// Fallback to Anvil if healthy, otherwise remote.
-	if g.IsAnvilHealthy() {
-		return SimBackendAnvil
+		return SimBackendLocal
 	}
 	return SimBackendRemote
 }
 
-// UpdateBlockContext fetches the latest block header from the RPC and updates the
-// native EVM block context. This should be called periodically (e.g., once per block).
-func (g *GEVMSimulator) UpdateBlockContext(ctx context.Context) error {
-	type header struct {
-		Number     string `json:"number"`
-		Timestamp  string `json:"timestamp"`
-		BaseFee    string `json:"baseFeePerGas"`
-		GasLimit   string `json:"gasLimit"`
+// getBalanceSlot returns the correct storage slot for the balance of a token.
+// Most ERC‑20 tokens use slot 0, but USDC and USDbC on Base use slot 9.
+func getBalanceSlot(token common.Address) uint64 {
+	if token == config.USDCAddress || token == config.USDBCAddress {
+		return 9
 	}
-	reqBody := map[string]interface{}{
-		"jsonrpc": "2.0",
-		"method":  "eth_getBlockByNumber",
-		"params":  []interface{}{"latest", false},
-		"id":      1,
-	}
-	reqJSON, _ := json.Marshal(reqBody)
-	req, err := http.NewRequestWithContext(ctx, "POST", g.rpcURL, bytes.NewReader(reqJSON))
-	if err != nil {
-		return err
-	}
-	req.Header.Set("Content-Type", "application/json")
-	resp, err := g.httpClient.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return err
-	}
-	var rpcResp struct {
-		Result header `json:"result"`
-	}
-	if err := json.Unmarshal(body, &rpcResp); err != nil {
-		return err
-	}
-	if rpcResp.Result.Number == "" {
-		return errors.New("empty block header")
-	}
-	// Parse hex strings.
-	blockNum := new(big.Int)
-	blockNum.SetString(rpcResp.Result.Number[2:], 16)
-	timestamp := new(big.Int)
-	timestamp.SetString(rpcResp.Result.Timestamp[2:], 16)
-	baseFee := new(big.Int)
-	baseFee.SetString(rpcResp.Result.BaseFee[2:], 16)
-	gasLimit := new(big.Int)
-	gasLimit.SetString(rpcResp.Result.GasLimit[2:], 16)
+	return 0
+}
 
-	g.evmMu.Lock()
-	defer g.evmMu.Unlock()
-	g.blockCtx.BlockNumber = blockNum
-	g.blockCtx.Time = timestamp.Uint64()
-	g.blockCtx.BaseFee = baseFee
-	g.blockCtx.GasLimit = gasLimit.Uint64()
-	// Also update tx context gas price (set to base fee + small tip).
-	g.txCtx.GasPrice = new(big.Int).Add(baseFee, big.NewInt(1e9)) // 1 gwei tip
-	return nil
+// setERC20Balance sets the balance of a token for a given address.
+// Uses the correct storage slot for the token.
+func setERC20Balance(stateDB *gethstate.StateDB, token, holder common.Address, amount *big.Int) {
+	if amount == nil || amount.Sign() <= 0 {
+		return
+	}
+	slot := getBalanceSlot(token)
+	// keccak256(holder || slot)
+	slotBytes := common.BigToHash(big.NewInt(int64(slot))).Bytes()
+	key := common.BytesToHash(crypto.Keccak256(append(holder.Bytes(), slotBytes...)))
+	stateDB.SetState(token, key, common.BigToHash(amount))
 }
 
 // injectPoolState writes the current pool state from the matrix into the StateDB.
+// CRITICAL: Must hold pool.RLock() before reading any fields.
 func (g *GEVMSimulator) injectPoolState(stateDB *gethstate.StateDB, pool *types.PoolState) {
 	if pool == nil {
 		return
 	}
-
-	// Ensure big.Int fields are non‑nil.
-	if pool.Reserve0 == nil {
-		pool.Reserve0 = new(big.Int)
-	}
-	if pool.Reserve1 == nil {
-		pool.Reserve1 = new(big.Int)
-	}
-	if pool.SqrtPriceX96 == nil {
-		pool.SqrtPriceX96 = new(big.Int)
-	}
-	if pool.Liquidity == nil {
-		pool.Liquidity = new(big.Int)
-	}
+	pool.RLock()
+	defer pool.RUnlock()
 
 	// V2 reserves: slots 0 and 1.
 	if pool.DexType == types.DexAerodromeV2 || pool.DexType == types.DexAlienBaseV2 {
 		stateDB.SetState(pool.PoolAddress, common.BigToHash(big.NewInt(0)), common.BigToHash(pool.Reserve0))
 		stateDB.SetState(pool.PoolAddress, common.BigToHash(big.NewInt(1)), common.BigToHash(pool.Reserve1))
+		// Also set ERC‑20 balances for the pool.
+		setERC20Balance(stateDB, pool.Token0, pool.PoolAddress, pool.Reserve0)
+		setERC20Balance(stateDB, pool.Token1, pool.PoolAddress, pool.Reserve1)
 		return
 	}
 
-	// V3: slot0 is packed as:
-	//   uint160 sqrtPriceX96       (bits 0..159)
-	//   int24  tick                (bits 160..183)
-	//   uint16 observationIndex    (bits 184..199)
-	//   uint16 observationCardinality (bits 200..215)
-	//   uint16 observationCardinalityNext (bits 216..231)
-	//   uint8  feeProtocol         (bits 232..239)
-	//   bool   unlocked            (bit 240)
-	//
-	// We set sqrtPriceX96 and tick (and force unlocked = true).
-	// The other fields are left as zero (acceptable for simulation).
-	packed := new(big.Int).Set(pool.SqrtPriceX96) // low 160 bits
-
-	// tick (int24) as 24‑bit two's complement.
-	tickVal := uint64(int64(pool.Tick)) & 0xFFFFFF // mask to 24 bits
+	// V3: slot0 packed with sqrtPriceX96, tick, and unlocked flag.
+	packed := new(big.Int).Set(pool.SqrtPriceX96)
+	tickVal := uint64(int64(pool.Tick)) & 0xFFFFFF
 	tickBig := new(big.Int).SetUint64(tickVal)
-	tickBig.Lsh(tickBig, 160) // move to bits 160..183
+	tickBig.Lsh(tickBig, 160)
 	packed.Or(packed, tickBig)
-
-	// Set the unlocked flag (bit 240) to 1.
 	unlockedBit := new(big.Int).Lsh(big.NewInt(1), 240)
 	packed.Or(packed, unlockedBit)
-
 	stateDB.SetState(pool.PoolAddress, common.BigToHash(big.NewInt(0)), common.BigToHash(packed))
-
-	// Slot1: liquidity (uint128)
 	stateDB.SetState(pool.PoolAddress, common.BigToHash(big.NewInt(1)), common.BigToHash(pool.Liquidity))
 
-	// No other slots are required for basic V3 swaps; the pool reads fee and token0/1
-	// via code views, which are already provided by StateCache.
+	// For V3 we cannot easily compute reserve amounts from sqrtPrice and liquidity,
+	// but we can set a huge balance for the pool to cover any transfer.
+	huge := new(big.Int).Exp(big.NewInt(10), big.NewInt(30), nil)
+	setERC20Balance(stateDB, pool.Token0, pool.PoolAddress, huge)
+	setERC20Balance(stateDB, pool.Token1, pool.PoolAddress, huge)
 }
 
-// SimulateNative runs a simulation using the in‑process EVM with state injected from the matrix.
-// It returns success, gasUsed, and error.
-func (g *GEVMSimulator) SimulateNative(
-	payload *types.ExecutionPayload,
-) (bool, uint64, error) {
+// SimulateNative runs a simulation using an isolated in‑process EVM.
+func (g *GEVMSimulator) SimulateNative(payload *types.ExecutionPayload) (bool, uint64, error) {
 	if payload == nil || payload.Calldata == nil {
 		return false, 0, errors.New("invalid payload")
 	}
@@ -483,17 +324,17 @@ func (g *GEVMSimulator) SimulateNative(
 		return false, 0, errors.New("no matrix set for local EVM state injection")
 	}
 
-	g.evmMu.Lock()
-	// Create a fresh state for this simulation to avoid contaminating the base state.
-	root := g.nativeState.IntermediateRoot(false)
-	triedbDB := triedb.NewDatabase(g.nativeDB, nil)
-	stateDB := gethstate.NewDatabaseWithNodeDB(g.nativeDB, triedbDB)
+	// ===== Thread‑safe state isolation =====
+	// Each simulation gets its own memory database.
+	localMemDB := rawdb.NewMemoryDatabase()
+	localTrieDB := triedb.NewDatabase(localMemDB, nil)
+	stateDB := gethstate.NewDatabaseWithNodeDB(localMemDB, localTrieDB)
 
-	newState, err := gethstate.New(root, stateDB, nil)
+	newState, err := gethstate.New(common.Hash{}, stateDB, nil)
 	if err != nil {
-		g.evmMu.Unlock()
-		return false, 0, fmt.Errorf("failed to copy state: %w", err)
+		return false, 0, fmt.Errorf("failed to create state: %w", err)
 	}
+
 	// Inject contract code from cache.
 	if g.cache != nil {
 		if code, ok := g.cache.GetCode(payload.TargetExecutor); ok {
@@ -505,27 +346,34 @@ func (g *GEVMSimulator) SimulateNative(
 			}
 		}
 	}
-	// Inject fresh pool state from matrix.
+
+	// Inject pool states and ERC‑20 balances.
 	for _, poolAddr := range payload.RoutePools {
 		if poolAddr == (common.Address{}) {
 			continue
 		}
-		pool := g.matrix.GetPool(poolAddr)
-		if pool != nil {
+		if pool := g.matrix.GetPool(poolAddr); pool != nil {
 			g.injectPoolState(newState, pool)
 		}
 	}
-	g.evmMu.Unlock()
 
-	// Prepare EVM.
+	// Ensure the flash‑loan provider has a huge balance of the borrowed token.
+	if payload.LoanPool != (common.Address{}) && payload.BorrowedToken != (common.Address{}) {
+		huge := new(big.Int).Exp(big.NewInt(10), big.NewInt(30), nil)
+		setERC20Balance(newState, payload.BorrowedToken, payload.LoanPool, huge)
+	}
+
+	// Snapshot block context under lock.
+	g.evmMu.RLock()
 	blockCtx := g.blockCtx
 	txCtx := vm.TxContext{
 		Origin:   g.owner,
 		GasPrice: g.txCtx.GasPrice,
 	}
-	evm := vm.NewEVM(blockCtx, txCtx, newState, g.chainConfig, vm.Config{})
+	g.evmMu.RUnlock()
 
 	// Execute.
+	evm := vm.NewEVM(blockCtx, txCtx, newState, g.chainConfig, vm.Config{})
 	outputs, leftOverGas, err := evm.Call(
 		vm.AccountRef(g.owner),
 		payload.TargetExecutor,
@@ -536,13 +384,11 @@ func (g *GEVMSimulator) SimulateNative(
 	gasUsed := payload.GasLimit - leftOverGas
 
 	if err != nil {
-		// Attempt to decode revert data if present.
 		if len(outputs) > 0 {
 			var revertMsg string
 			if len(outputs) >= 4 {
 				selector := outputs[:4]
-				decoded, decodeErr := decodeCustomError(selector, outputs[4:])
-				if decodeErr == nil {
+				if decoded, decodeErr := decodeCustomError(selector, outputs[4:]); decodeErr == nil {
 					revertMsg = decoded
 				} else {
 					revertMsg = fmt.Sprintf("revert data: %x", outputs)
@@ -566,8 +412,6 @@ func (g *GEVMSimulator) SimulateWithBackend(
 	switch backend {
 	case SimBackendLocal:
 		return g.SimulateNative(payload)
-	case SimBackendAnvil:
-		return g.simulateAnvil(payload)
 	case SimBackendRemote:
 		fallthrough
 	default:
@@ -575,12 +419,11 @@ func (g *GEVMSimulator) SimulateWithBackend(
 	}
 }
 
-// simulateRemote performs eth_call + eth_estimateGas via RPC.
+// simulateRemote performs eth_call (no gas estimation to save time).
 func (g *GEVMSimulator) simulateRemote(payload *types.ExecutionPayload) (bool, uint64, error) {
 	if payload == nil || payload.Calldata == nil {
 		return false, 0, errors.New("invalid payload")
 	}
-	// Acquire remote concurrency token.
 	select {
 	case g.remoteSem <- struct{}{}:
 		defer func() { <-g.remoteSem }()
@@ -588,45 +431,12 @@ func (g *GEVMSimulator) simulateRemote(payload *types.ExecutionPayload) (bool, u
 		return false, 0, errors.New("remote simulation concurrency limit reached")
 	}
 
-	targetURL := g.rpcURL
-	success, _, err := g.doEthCall(targetURL, payload)
+	success, _, err := g.doEthCall(g.rpcURL, payload)
 	if err != nil || !success {
 		return success, 0, err
 	}
-	gasUsed, err := g.estimateGas(targetURL, payload)
-	if err != nil {
-		return true, 0, fmt.Errorf("gas estimation failed: %w", err)
-	}
-	return true, gasUsed, nil
-}
-
-// simulateAnvil runs simulation against a local Anvil fork.
-func (g *GEVMSimulator) simulateAnvil(payload *types.ExecutionPayload) (bool, uint64, error) {
-	if payload == nil || payload.Calldata == nil {
-		return false, 0, errors.New("invalid payload")
-	}
-	if !g.IsAnvilHealthy() {
-		return g.simulateRemote(payload)
-	}
-	select {
-	case g.anvilSem <- struct{}{}:
-		defer func() { <-g.anvilSem }()
-	case <-time.After(500 * time.Millisecond):
-		return false, 0, errors.New("anvil simulation concurrency limit reached")
-	}
-	url := g.getAnvilURL()
-	if url == "" {
-		return false, 0, errors.New("anvil URL not set")
-	}
-	success, _, err := g.doEthCall(url, payload)
-	if err != nil || !success {
-		return g.simulateRemote(payload)
-	}
-	gasUsed, err := g.estimateGas(url, payload)
-	if err != nil {
-		return true, 0, fmt.Errorf("anvil gas estimation failed: %w", err)
-	}
-	return true, gasUsed, nil
+	// Use provided gas limit; we skip estimateGas for speed.
+	return true, payload.GasLimit, nil
 }
 
 // doEthCall performs eth_call and decodes revert data.
@@ -646,7 +456,9 @@ func (g *GEVMSimulator) doEthCall(targetURL string, payload *types.ExecutionPayl
 	if err != nil {
 		return false, "", err
 	}
-	req, err := http.NewRequest("POST", targetURL, bytes.NewReader(reqJSON))
+	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, "POST", targetURL, bytes.NewReader(reqJSON))
 	if err != nil {
 		return false, "", err
 	}
@@ -677,11 +489,9 @@ func (g *GEVMSimulator) doEthCall(targetURL string, payload *types.ExecutionPayl
 			if rpcResp.Error.Data != "" {
 				dataHex := strings.TrimPrefix(rpcResp.Error.Data, "0x")
 				if len(dataHex) >= 8 {
-					dataBytes, err := hex.DecodeString(dataHex)
-					if err == nil && len(dataBytes) >= 4 {
+					if dataBytes, err := hex.DecodeString(dataHex); err == nil && len(dataBytes) >= 4 {
 						selector := dataBytes[:4]
-						decoded, decodeErr := decodeCustomError(selector, dataBytes[4:])
-						if decodeErr == nil {
+						if decoded, decodeErr := decodeCustomError(selector, dataBytes[4:]); decodeErr == nil {
 							revertMsg = decoded
 						}
 					}
@@ -694,93 +504,45 @@ func (g *GEVMSimulator) doEthCall(targetURL string, payload *types.ExecutionPayl
 	return true, rpcResp.Result, nil
 }
 
-// estimateGas performs eth_estimateGas.
-func (g *GEVMSimulator) estimateGas(targetURL string, payload *types.ExecutionPayload) (uint64, error) {
-	callArgs := map[string]interface{}{
-		"to":   payload.TargetExecutor.Hex(),
-		"data": "0x" + hex.EncodeToString(payload.Calldata),
-		"from": g.owner.Hex(),
-	}
-	reqBody := map[string]interface{}{
-		"jsonrpc": "2.0",
-		"method":  "eth_estimateGas",
-		"params":  []interface{}{callArgs},
-		"id":      1,
-	}
-	reqJSON, err := json.Marshal(reqBody)
-	if err != nil {
-		return 0, err
-	}
-	req, err := http.NewRequest("POST", targetURL, bytes.NewReader(reqJSON))
-	if err != nil {
-		return 0, err
-	}
-	req.Header.Set("Content-Type", "application/json")
-	resp, err := g.httpClient.Do(req)
-	if err != nil {
-		return 0, err
-	}
-	defer resp.Body.Close()
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return 0, err
-	}
-	var rpcResp struct {
-		Result string `json:"result"`
-		Error  struct {
-			Code    int    `json:"code"`
-			Message string `json:"message"`
-		} `json:"error"`
-	}
-	if err := json.Unmarshal(body, &rpcResp); err != nil {
-		return 0, err
-	}
-	if rpcResp.Error.Code != 0 {
-		return 0, fmt.Errorf("eth_estimateGas error: %s", rpcResp.Error.Message)
-	}
-	gasHex := strings.TrimPrefix(rpcResp.Result, "0x")
-	gas, err := hexutil.DecodeUint64("0x" + gasHex)
-	if err != nil {
-		return 0, fmt.Errorf("failed to parse gas: %w", err)
-	}
-	return gas, nil
-}
-
 // decodeCustomError decodes known Solidity errors from revert data.
 func decodeCustomError(selector []byte, data []byte) (string, error) {
 	var sel [4]byte
 	copy(sel[:], selector)
 
-	if bytes.Equal(sel[:], insufficientProfitSelector) {
+	switch {
+	case bytes.Equal(sel[:], insufficientProfitSelector):
 		vals, err := revertABI.Unpack("InsufficientProfit", data)
-		if err != nil {
+		if err != nil || len(vals) != 2 {
 			return "", err
 		}
-		if len(vals) == 2 {
-			actual, ok1 := vals[0].(*big.Int)
-			required, ok2 := vals[1].(*big.Int)
-			if ok1 && ok2 {
-				return fmt.Sprintf("InsufficientProfit(actual=%d, required=%d)", actual, required), nil
-			}
+		actual, ok1 := vals[0].(*big.Int)
+		required, ok2 := vals[1].(*big.Int)
+		if !ok1 || !ok2 {
+			return "", errors.New("unexpected types")
 		}
-	} else if bytes.Equal(sel[:], insufficientOutputSelector) {
+		return fmt.Sprintf("InsufficientProfit(actual=%d, required=%d)", actual, required), nil
+
+	case bytes.Equal(sel[:], insufficientOutputSelector):
 		vals, err := revertABI.Unpack("InsufficientOutput", data)
-		if err != nil {
+		if err != nil || len(vals) != 2 {
 			return "", err
 		}
-		if len(vals) == 2 {
-			actual, ok1 := vals[0].(*big.Int)
-			required, ok2 := vals[1].(*big.Int)
-			if ok1 && ok2 {
-				return fmt.Sprintf("InsufficientOutput(actual=%d, required=%d)", actual, required), nil
-			}
+		actual, ok1 := vals[0].(*big.Int)
+		required, ok2 := vals[1].(*big.Int)
+		if !ok1 || !ok2 {
+			return "", errors.New("unexpected types")
 		}
-	} else if bytes.Equal(sel[:], swapExecutionFailedSelector) {
+		return fmt.Sprintf("InsufficientOutput(actual=%d, required=%d)", actual, required), nil
+
+	case bytes.Equal(sel[:], swapExecutionFailedSelector):
 		return "SwapExecutionFailed()", nil
-	} else if bytes.Equal(sel[:], loanRepaymentFailedSelector) {
+
+	case bytes.Equal(sel[:], loanRepaymentFailedSelector):
 		return "LoanRepaymentFailed()", nil
+
+	default:
+		return "", fmt.Errorf("unknown error selector")
 	}
-	return "", fmt.Errorf("unknown error selector")
 }
 
 // SimulateCandidate is a wrapper that chooses the backend automatically.
