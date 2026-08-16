@@ -708,21 +708,19 @@ func worker2(
 				GasLimit:       defaultGasLimit,
 			}
 
-					var success bool
+			var success bool
 			var gasUsed uint64
 
 			if backend == execution.SimBackendLocal {
-				// Local simulation is synchronous and doesn't require an explicit context
+				// No context needed for local simulation – it's synchronous.
 				success, gasUsed, err = gevm.SimulateNative(simPayload)
 				if err != nil || !success {
-					// FIXED: Pass worker lifecycle context down to the remote fallback call
-					success, gasUsed, err = gevm.SimulateWithBackend(ctx, cand, simPayload, execution.SimBackendRemote)
+					// Fall back to remote if local fails.
+					success, gasUsed, err = gevm.SimulateWithBackend(cand, simPayload, execution.SimBackendRemote)
 				}
 			} else {
-				// FIXED: Pass worker lifecycle context down to the primary remote call
-				success, gasUsed, err = gevm.SimulateWithBackend(ctx, cand, simPayload, backend)
+				success, gasUsed, err = gevm.SimulateWithBackend(cand, simPayload, backend)
 			}
-
 
 			if err != nil || !success {
 				reverted := (err != nil && strings.Contains(err.Error(), "execution reverted"))
