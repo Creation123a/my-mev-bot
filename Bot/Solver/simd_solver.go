@@ -24,11 +24,11 @@ import (
 const (
 	MaxSlippagePct   = 3.0
 	MaxHops          = 3
-	SlippageBuffer   = 0.99  // 1% buffer (minOut = actualOut * 0.99)
+	SlippageBuffer   = 0.99
 	HopPenalty3Hop   = 0.05
 	MinScore         = 0.01
+	MemeAdmissionProfit = 0.50 // USD gross – used by gatekeeper for meme qualification
 )
-
 // v3CalcPool hands each goroutine its own calculator buffers.
 var v3CalcPool = sync.Pool{
 	New: func() interface{} {
