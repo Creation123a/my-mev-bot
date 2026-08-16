@@ -50,20 +50,3 @@ var (
 	DODOApproveProxy = common.HexToAddress("0x6de4d882a84A98f4CCD5D33ea6b3C99A07BAbeB1")
 )
 
-// =============================================================================
-// 4 Target DEX Routers (used only for reference; factories are fetched via PoolRegistry)
-// =============================================================================
-
-var (
-	// UniswapV3Router is the Uniswap V3 SwapRouter02.
-	UniswapV3Router = common.HexToAddress("0x2626664c2603336E57B271c5C0b26F421741e481")
-
-	// PancakeV3Router is the PancakeSwap V3 router on Base.
-	PancakeV3Router = common.HexToAddress("0x1b81D678ffb9C0263b24A97847620C99d213eB14")
-
-	// AerodromeRouterV2 is the Aerodrome V2/Slipstream router.
-	AerodromeRouterV2 = common.HexToAddress("0xcF77a3Ba9A5CA399B7c97c74d54e5b1Beb874E43")
-
-	// AlienBaseRouterV2 is the AlienBase (BaseSwap compatible) router.
-	AlienBaseRouterV2 = common.HexToAddress("0x8c1A3cF8f83074169FE5D7aD50B978e1cD6b37c7")
-)
