@@ -15,12 +15,14 @@ import (
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/ethclient"
 
-	"my-mev-bot/Bot/PoolRegistry"
 	"my-mev-bot/Bot/Types"
 )
 
 const (
-	discoveryBlacklistTTL = 5 * time.Minute
+	// Capped exactly at our 6 DEX * 12 Pair limit to protect active simulation memory
+	MaxPools = 36
+	// MaxTokens expanded to support our 6 Base Pairs + 60 Dynamic Memes + buffer safety
+	MaxTokens = 72
 )
 
 type PoolStats struct {
@@ -77,218 +79,36 @@ type Matrix struct {
 	poolStats        map[common.Address]*PoolStats
 
 	tokenToSlot map[common.Address]uint8
-	slotToToken [44]common.Address
-	matrix      [44][44]uint64
+	slotToToken [MaxTokens]common.Address
+	matrix      [MaxTokens][MaxTokens]uint64
 
 	ethClient *ethclient.Client
-	registry  *poolregistry.PoolRegistry
 
-	token0ABI      abi.ABI
-	token1ABI      abi.ABI
-	feeABI         abi.ABI
-	getReservesABI abi.ABI
-	factoryABI     abi.ABI
-
-	discoveryBlacklist   map[common.Address]time.Time
-	discoveryBlacklistMu sync.RWMutex
+	// Only factory ABI kept for CallFactory – used by gatekeeper.
+	factoryABI abi.ABI
 }
 
 func NewMatrix() *Matrix {
-	token0ABI, _ := abi.JSON(strings.NewReader(`[{"type":"function","name":"token0","inputs":[],"outputs":[{"type":"address"}]}]`))
-	token1ABI, _ := abi.JSON(strings.NewReader(`[{"type":"function","name":"token1","inputs":[],"outputs":[{"type":"address"}]}]`))
-	feeABI, _ := abi.JSON(strings.NewReader(`[{"type":"function","name":"fee","inputs":[],"outputs":[{"type":"uint24"}]}]`))
-	getReservesABI, _ := abi.JSON(strings.NewReader(`[{"type":"function","name":"getReserves","inputs":[],"outputs":[{"type":"uint112","name":"reserve0"},{"type":"uint112","name":"reserve1"},{"type":"uint32","name":"blockTimestampLast"}]}]`))
+	// Only the factory ABI is needed for CallFactory.
 	factoryABI, _ := abi.JSON(strings.NewReader(`[{"type":"function","name":"factory","inputs":[],"outputs":[{"type":"address"}]}]`))
 
-	return &Matrix{
-		pools:              make(map[common.Address]*types.PoolState, 128),
-		affectedPaths:      make(map[common.Address][]*types.Path, 128),
-		tokenPairToPools:   make(map[[2]common.Address][]*types.PoolState, 128),
-		poolStats:          make(map[common.Address]*PoolStats, 128),
-		tokenToSlot:        make(map[common.Address]uint8, 128),
-		token0ABI:          token0ABI,
-		token1ABI:          token1ABI,
-		feeABI:             feeABI,
-		getReservesABI:     getReservesABI,
-		factoryABI:         factoryABI,
-		discoveryBlacklist: make(map[common.Address]time.Time),
+	m := &Matrix{
+		pools:            make(map[common.Address]*types.PoolState, MaxPools),
+		affectedPaths:    make(map[common.Address][]*types.Path, MaxPools),
+		tokenPairToPools: make(map[[2]common.Address][]*types.PoolState, MaxPools),
+		poolStats:        make(map[common.Address]*PoolStats, MaxPools),
+		tokenToSlot:      make(map[common.Address]uint8, MaxTokens),
+		factoryABI:       factoryABI,
 	}
+
+	return m
 }
 
-func (m *Matrix) SetEthClient(client *ethclient.Client)      { m.ethClient = client }
-func (m *Matrix) SetRegistry(reg *poolregistry.PoolRegistry) { m.registry = reg }
+func (m *Matrix) SetEthClient(client *ethclient.Client) { m.ethClient = client }
 
-func (m *Matrix) isDiscoveryBlacklisted(addr common.Address) bool {
-	m.discoveryBlacklistMu.Lock()
-	defer m.discoveryBlacklistMu.Unlock()
-	expiry, ok := m.discoveryBlacklist[addr]
-	if !ok {
-		return false
-	}
-	if time.Now().Before(expiry) {
-		return true
-	}
-	delete(m.discoveryBlacklist, addr)
-	return false
-}
-
-func (m *Matrix) markDiscoveryFailed(addr common.Address) {
-	m.discoveryBlacklistMu.Lock()
-	defer m.discoveryBlacklistMu.Unlock()
-	m.discoveryBlacklist[addr] = time.Now().Add(discoveryBlacklistTTL)
-}
-
-func (m *Matrix) ensurePool(log *types.SwapLog) error {
-	m.mu.RLock()
-	_, exists := m.pools[log.Address]
-	m.mu.RUnlock()
-	if exists {
-		return nil
-	}
-
-	if m.isDiscoveryBlacklisted(log.Address) {
-		return fmt.Errorf("discovery skipped for blacklisted pool %s", log.Address.Hex())
-	}
-	if m.ethClient == nil || m.registry == nil {
-		return fmt.Errorf("infrastructure dependencies uninitialized")
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-
-	token0, err := m.callToken0(ctx, log.Address)
-	if err != nil {
-		token0, err = m.callToken0V2(ctx, log.Address)
-		if err != nil {
-			m.markDiscoveryFailed(log.Address)
-			return err
-		}
-	}
-	token1, err := m.callToken1(ctx, log.Address)
-	if err != nil {
-		token1, err = m.callToken1V2(ctx, log.Address)
-		if err != nil {
-			m.markDiscoveryFailed(log.Address)
-			return err
-		}
-	}
-
-	var dexType types.DexType
-	var feeBps uint32 = 30
-
-	factory, err := m.callFactory(ctx, log.Address)
-	if err == nil {
-		if factory == m.registry.UniswapV3Factory() {
-			dexType = types.DexUniswapV3
-		} else if factory == m.registry.PancakeV3Factory() {
-			dexType = types.DexPancakeV3
-		} else {
-			goto V2
-		}
-		rawFee, err := m.callFee(ctx, log.Address)
-		if err == nil {
-			feeBps = rawFee / 100
-		}
-		pool := &types.PoolState{
-			PoolAddress:  log.Address,
-			Token0:       token0,
-			Token1:       token1,
-			DexType:      dexType,
-			FeeBps:       feeBps,
-			Reserve0:     new(big.Int),
-			Reserve1:     new(big.Int),
-			SqrtPriceX96: new(big.Int),
-			Liquidity:    new(big.Int),
-		}
-		m.RegisterPool(pool)
-		return nil
-	}
-
-V2:
-	factory2, err := m.callFactory(ctx, log.Address)
-	if err != nil {
-		m.markDiscoveryFailed(log.Address)
-		return err
-	}
-	var ok bool
-	dexType, ok = m.determineV2DexType(factory2)
-	if !ok {
-		m.markDiscoveryFailed(log.Address)
-		return fmt.Errorf("unknown factory configuration format mapping")
-	}
-	r0, r1, err := m.callGetReserves(ctx, log.Address)
-	if err != nil {
-		m.markDiscoveryFailed(log.Address)
-		return err
-	}
-
-	pool := &types.PoolState{
-		PoolAddress:   log.Address,
-		Token0:        token0,
-		Token1:        token1,
-		DexType:       dexType,
-		FeeBps:        30,
-		Reserve0:      r0,
-		Reserve1:      r1,
-		SqrtPriceX96:  new(big.Int),
-		Liquidity:     new(big.Int),
-		Reserve0Float: float64FromBig(r0),
-		Reserve1Float: float64FromBig(r1),
-	}
-	m.RegisterPool(pool)
-	return nil
-}
-
-func (m *Matrix) determineV2DexType(factory common.Address) (types.DexType, bool) {
-	if m.registry == nil {
-		return 0, false
-	}
-	if factory == m.registry.AerodromeV2Factory() {
-		return types.DexAerodromeV2, true
-	}
-	if factory == m.registry.AlienBaseV2Factory() {
-		return types.DexAlienBaseV2, true
-	}
-	return 0, false
-}
-
-func (m *Matrix) callToken0(ctx context.Context, pool common.Address) (common.Address, error) {
-	data, _ := m.token0ABI.Pack("token0")
-	out, err := m.ethClient.CallContract(ctx, ethereum.CallMsg{To: &pool, Data: data}, nil)
-	if err != nil {
-		return common.Address{}, err
-	}
-	var result common.Address
-	_ = m.token0ABI.UnpackIntoInterface(&result, "token0", out)
-	return result, nil
-}
-
-func (m *Matrix) callToken1(ctx context.Context, pool common.Address) (common.Address, error) {
-	data, _ := m.token1ABI.Pack("token1")
-	out, err := m.ethClient.CallContract(ctx, ethereum.CallMsg{To: &pool, Data: data}, nil)
-	if err != nil {
-		return common.Address{}, err
-	}
-	var result common.Address
-	_ = m.token1ABI.UnpackIntoInterface(&result, "token1", out)
-	return result, nil
-}
-
-func (m *Matrix) callFee(ctx context.Context, pool common.Address) (uint32, error) {
-	data, _ := m.feeABI.Pack("fee")
-	out, err := m.ethClient.CallContract(ctx, ethereum.CallMsg{To: &pool, Data: data}, nil)
-	if err != nil {
-		return 0, err
-	}
-	var raw big.Int
-	_ = m.feeABI.UnpackIntoInterface(&raw, "fee", out)
-	if raw.Uint64() > 0xFFFFFF {
-		return 0, fmt.Errorf("out of range bounds")
-	}
-	return uint32(raw.Uint64()), nil
-}
-
-func (m *Matrix) callFactory(ctx context.Context, pool common.Address) (common.Address, error) {
+// CallFactory fetches the factory address from a pool contract.
+// Used by the gatekeeper for dynamic discovery.
+func (m *Matrix) CallFactory(ctx context.Context, pool common.Address) (common.Address, error) {
 	data, _ := m.factoryABI.Pack("factory")
 	out, err := m.ethClient.CallContract(ctx, ethereum.CallMsg{To: &pool, Data: data}, nil)
 	if err != nil {
@@ -297,33 +117,6 @@ func (m *Matrix) callFactory(ctx context.Context, pool common.Address) (common.A
 	var result common.Address
 	_ = m.factoryABI.UnpackIntoInterface(&result, "factory", out)
 	return result, nil
-}
-
-// callGetReserves – fixed type assertion (Bug #1)
-func (m *Matrix) callGetReserves(ctx context.Context, pool common.Address) (*big.Int, *big.Int, error) {
-	data, _ := m.getReservesABI.Pack("getReserves")
-	out, err := m.ethClient.CallContract(ctx, ethereum.CallMsg{To: &pool, Data: data}, nil)
-	if err != nil {
-		return nil, nil, err
-	}
-	vals, err := m.getReservesABI.Unpack("getReserves", out)
-	if err != nil || len(vals) < 2 {
-		return nil, nil, fmt.Errorf("decode error")
-	}
-	// Correctly extract from slice indices
-	r0, ok0 := vals[0].(*big.Int)
-	r1, ok1 := vals[1].(*big.Int)
-	if !ok0 || !ok1 {
-		return nil, nil, fmt.Errorf("unexpected types from getReserves")
-	}
-	return r0, r1, nil
-}
-
-func (m *Matrix) callToken0V2(ctx context.Context, pool common.Address) (common.Address, error) {
-	return m.callToken0(ctx, pool)
-}
-func (m *Matrix) callToken1V2(ctx context.Context, pool common.Address) (common.Address, error) {
-	return m.callToken1(ctx, pool)
 }
 
 func (m *Matrix) RegisterPath(path *types.Path) {
@@ -349,16 +142,61 @@ func (m *Matrix) RegisterPool(pool *types.PoolState) {
 		return
 	}
 	m.normalizePoolState(pool)
+	pool.LastUpdated = time.Now()
 	m.pools[pool.PoolAddress] = pool
 	m.addToTokenPairIndexLocked(pool)
 	m.poolStats[pool.PoolAddress] = newPoolStats()
+
+	// High-performance cache limit maintenance
+	if len(m.pools) > MaxPools {
+		m.evictLRULocked()
+	}
+}
+
+func (m *Matrix) evictLRULocked() {
+	if len(m.pools) == 0 {
+		return
+	}
+	var oldest time.Time
+	var oldestAddr common.Address
+	for addr, p := range m.pools {
+		if oldest.IsZero() || p.LastUpdated.Before(oldest) {
+			oldest = p.LastUpdated
+			oldestAddr = addr
+		}
+	}
+	if oldestAddr != (common.Address{}) {
+		delete(m.pools, oldestAddr)
+		delete(m.poolStats, oldestAddr)
+		for pair, pools := range m.tokenPairToPools {
+			var newSlice []*types.PoolState
+			for _, p := range pools {
+				if p.PoolAddress != oldestAddr {
+					newSlice = append(newSlice, p)
+				}
+			}
+			if len(newSlice) == 0 {
+				delete(m.tokenPairToPools, pair)
+			} else {
+				m.tokenPairToPools[pair] = newSlice
+			}
+		}
+	}
 }
 
 func (m *Matrix) normalizePoolState(pool *types.PoolState) {
-	if pool.Reserve0 == nil { pool.Reserve0 = new(big.Int) }
-	if pool.Reserve1 == nil { pool.Reserve1 = new(big.Int) }
-	if pool.SqrtPriceX96 == nil { pool.SqrtPriceX96 = new(big.Int) }
-	if pool.Liquidity == nil { pool.Liquidity = new(big.Int) }
+	if pool.Reserve0 == nil {
+		pool.Reserve0 = new(big.Int)
+	}
+	if pool.Reserve1 == nil {
+		pool.Reserve1 = new(big.Int)
+	}
+	if pool.SqrtPriceX96 == nil {
+		pool.SqrtPriceX96 = new(big.Int)
+	}
+	if pool.Liquidity == nil {
+		pool.Liquidity = new(big.Int)
+	}
 }
 
 func (m *Matrix) addToTokenPairIndexLocked(pool *types.PoolState) {
@@ -373,18 +211,12 @@ func canonicalPair(a, b common.Address) [2]common.Address {
 	return [2]common.Address{b, a}
 }
 
+// UpdateFromLog updates a known pool's state from a swap log.
+// It assumes the pool already exists in the matrix (unknown pools are handled by the gatekeeper).
 func (m *Matrix) UpdateFromLog(log *types.SwapLog) []*types.Path {
 	m.mu.RLock()
-	pool, exists := m.pools[log.Address]
+	pool := m.pools[log.Address]
 	m.mu.RUnlock()
-	if !exists {
-		if err := m.ensurePool(log); err != nil {
-			return nil
-		}
-		m.mu.RLock()
-		pool = m.pools[log.Address]
-		m.mu.RUnlock()
-	}
 	if pool == nil {
 		return nil
 	}
@@ -400,6 +232,7 @@ func (m *Matrix) UpdateFromLog(log *types.SwapLog) []*types.Path {
 	default:
 		m.updateV2Pool(pool, log, oldReserve0, oldReserve1)
 	}
+	pool.LastUpdated = time.Now()
 	pool.Unlock()
 
 	m.mu.RLock()
@@ -477,9 +310,13 @@ func (m *Matrix) updateV2Pool(pool *types.PoolState, log *types.SwapLog, oldR0, 
 			tolerance = big.NewInt(1)
 		}
 		diffA := new(big.Int).Sub(expectedOutA, amountOut)
-		if diffA.Sign() < 0 { diffA.Neg(diffA) }
+		if diffA.Sign() < 0 {
+			diffA.Neg(diffA)
+		}
 		diffB := new(big.Int).Sub(expectedOutB, amountOut)
-		if diffB.Sign() < 0 { diffB.Neg(diffB) }
+		if diffB.Sign() < 0 {
+			diffB.Neg(diffB)
+		}
 
 		matchA := diffA.Cmp(tolerance) <= 0
 		matchB := diffB.Cmp(tolerance) <= 0
@@ -526,8 +363,12 @@ func (m *Matrix) updateV2Pool(pool *types.PoolState, log *types.SwapLog, oldR0, 
 		}
 	}
 
-	if pool.Reserve0.Sign() < 0 { pool.Reserve0.SetInt64(0) }
-	if pool.Reserve1.Sign() < 0 { pool.Reserve1.SetInt64(0) }
+	if pool.Reserve0.Sign() < 0 {
+		pool.Reserve0.SetInt64(0)
+	}
+	if pool.Reserve1.Sign() < 0 {
+		pool.Reserve1.SetInt64(0)
+	}
 	pool.Reserve0Float = float64FromBig(pool.Reserve0)
 	pool.Reserve1Float = float64FromBig(pool.Reserve1)
 }
@@ -571,7 +412,9 @@ func (m *Matrix) updateV3Pool(pool *types.PoolState, log *types.SwapLog, oldSqrt
 }
 
 func float64FromBig(v *big.Int) float64 {
-	if v == nil { return 0 }
+	if v == nil {
+		return 0
+	}
 	f, _ := new(big.Float).SetInt(v).Float64()
 	return f
 }
@@ -584,12 +427,16 @@ func (m *Matrix) GetPoolStats(poolAddr common.Address) *PoolStats {
 
 func (m *Matrix) GetPoolScore(poolAddr common.Address) float64 {
 	stats := m.GetPoolStats(poolAddr)
-	if stats == nil { return 0.5 }
+	if stats == nil {
+		return 0.5
+	}
 	stats.mu.RLock()
 	defer stats.mu.RUnlock()
 
 	heat := float64(stats.SwapsWindow1m) / 100.0
-	if heat > 1.0 { heat = 1.0 }
+	if heat > 1.0 {
+		heat = 1.0
+	}
 	var missRate float64
 	if stats.Broadcast > 10 {
 		missRate = 1.0 - float64(stats.Win)/float64(stats.Broadcast)
@@ -597,12 +444,20 @@ func (m *Matrix) GetPoolScore(poolAddr common.Address) float64 {
 	thinness := 0.0
 	if stats.LastLiquidityUSD > 0 {
 		thinness = 1.0 - (stats.LastLiquidityUSD / 1000000.0)
-		if thinness < 0 { thinness = 0 }
-		if thinness > 1 { thinness = 1 }
+		if thinness < 0 {
+			thinness = 0
+		}
+		if thinness > 1 {
+			thinness = 1
+		}
 	}
 	score := 0.35*heat + 0.20*missRate + 0.10*thinness
-	if score > 1 { score = 1 }
-	if score < 0 { score = 0 }
+	if score > 1 {
+		score = 1
+	}
+	if score < 0 {
+		score = 0
+	}
 	return score
 }
 
@@ -652,14 +507,18 @@ func (m *Matrix) GetPools() map[common.Address]*types.PoolState {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	cpy := make(map[common.Address]*types.PoolState, len(m.pools))
-	for k, v := range m.pools { cpy[k] = v }
+	for k, v := range m.pools {
+		cpy[k] = v
+	}
 	return cpy
 }
 
 func (m *Matrix) RegisterToken(token common.Address, slot uint8) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if slot >= 44 { return }
+	if slot >= MaxTokens {
+		return
+	}
 	m.tokenToSlot[token] = slot
 	m.slotToToken[slot] = token
 }
@@ -667,19 +526,25 @@ func (m *Matrix) RegisterToken(token common.Address, slot uint8) {
 func (m *Matrix) GetSlot(token common.Address) uint8 {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	if slot, ok := m.tokenToSlot[token]; ok { return slot }
+	if slot, ok := m.tokenToSlot[token]; ok {
+		return slot
+	}
 	return 255
 }
 
 func (m *Matrix) UpdateMatrixValue(row, col uint8, value uint64) {
-	if row >= 44 || col >= 44 { return }
+	if row >= MaxTokens || col >= MaxTokens {
+		return
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.matrix[row][col] = value
 }
 
 func (m *Matrix) GetMatrixValue(row, col uint8) uint64 {
-	if row >= 44 || col >= 44 { return 0 }
+	if row >= MaxTokens || col >= MaxTokens {
+		return 0
+	}
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	return m.matrix[row][col]
