@@ -3,10 +3,7 @@
 package config
 
 import (
-	"fmt"
-
 	"github.com/ethereum/go-ethereum/common"
-	"my-mev-bot/Bot/Types"
 )
 
 // =============================================================================
@@ -54,7 +51,7 @@ var (
 )
 
 // =============================================================================
-// 4 Target DEX Routers & Factories
+// 4 Target DEX Routers (used only for reference; factories are fetched via PoolRegistry)
 // =============================================================================
 
 var (
@@ -68,54 +65,5 @@ var (
 	AerodromeRouterV2 = common.HexToAddress("0xcF77a3Ba9A5CA399B7c97c74d54e5b1Beb874E43")
 
 	// AlienBaseRouterV2 is the AlienBase (BaseSwap compatible) router.
-	// Correct address from official AlienBase V2 on Base.
 	AlienBaseRouterV2 = common.HexToAddress("0x8c1A3cF8f83074169FE5D7aD50B978e1cD6b37c7")
-
-	// DEX factories (used for pool validation and dynamic discovery).
-	// NOTE: These addresses must be set to the correct mainnet values before production use.
-	// If left as zero, the DEX type detection for V2 pools will default to Aerodrome V2.
-	UniswapV3Factory = common.HexToAddress("0x33128a8fC17869897dcE68Ed026d694621f6FDfD")
-	PancakeV3Factory = common.HexToAddress("0x0BFbCF9fa4f9C56B0F40a671Ad40E0805A091865")
-	AerodromeFactory = common.HexToAddress("0x420DD3807Eae25ad71F4229994854528A4aBc3cd") // TODO: Replace with actual Aerodrome V2 factory address
-	AlienBaseFactory = common.HexToAddress("0x420DD3807Eae25ad71F4229994854528A4aBc3cd") // TODO: Replace with actual AlienBase factory address
 )
-
-// =============================================================================
-// DEX Type Mapping
-// =============================================================================
-
-// routerToDexType maps each router address to its corresponding types.DexType.
-var routerToDexType = map[common.Address]types.DexType{
-	UniswapV3Router:   types.DexUniswapV3,
-	PancakeV3Router:   types.DexPancakeV3,
-	AerodromeRouterV2: types.DexAerodromeV2,
-	AlienBaseRouterV2: types.DexAlienBaseV2,
-}
-
-// GetDexType returns the DexType for a given router address and a boolean indicating
-// whether the router is known. Callers must reject a route when ok is false.
-func GetDexType(router common.Address) (types.DexType, bool) {
-	t, ok := routerToDexType[router]
-	return t, ok
-}
-
-// =============================================================================
-// Factory Address Validation
-// =============================================================================
-
-// ValidateFactories checks that all factory addresses required for DEX detection
-// are populated. It returns an error if any required factory is the zero address.
-// Call this during startup before enabling dynamic pool discovery.
-func ValidateFactories() error {
-	for name, addr := range map[string]common.Address{
-		"UniswapV3Factory": UniswapV3Factory,
-		"PancakeV3Factory": PancakeV3Factory,
-		"AerodromeFactory": AerodromeFactory,
-		"AlienBaseFactory": AlienBaseFactory,
-	} {
-		if addr == (common.Address{}) {
-			return fmt.Errorf("%s is not configured (zero address)", name)
-		}
-	}
-	return nil
-}
