@@ -225,8 +225,7 @@ func main() {
 
 	// ---- Removed Anvil health checks and background ticker ----
 
-
-	sender, err := execution.NewSender(cfg.BaseHTTPRPC,  cfg.PrivateKey)
+	sender, err := execution.NewSender(cfg.BaseHTTPRPC, cfg.PrivateKey)
 	if err != nil {
 		log.Fatalf("Failed to initialize sender: %v", err)
 	}
@@ -611,7 +610,7 @@ func getTokenDecimals(token common.Address) int {
 	return 18
 }
 
-// worker2 – fixed context leak
+// worker2 – fixed context leak and remote fallback
 func worker2(
 	ctx context.Context,
 	candidateChan <-chan *types.RouteCandidate,
@@ -709,20 +708,21 @@ func worker2(
 				GasLimit:       defaultGasLimit,
 			}
 
-			var success bool
+					var success bool
 			var gasUsed uint64
 
-		if backend == execution.SimBackendLocal {
-    // Use context with timeout and cancel immediately to avoid memory leak
-    _, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-    success, gasUsed, err = gevm.SimulateNative(simPayload)
-    cancel()
-    if err != nil || !success {
-        success, gasUsed, err = gevm.SimulateWithBackend(cand, simPayload, execution.SimBackendRemote)
-    }
-}else {
-				success, gasUsed, err = gevm.SimulateWithBackend(cand, simPayload, backend)
+			if backend == execution.SimBackendLocal {
+				// Local simulation is synchronous and doesn't require an explicit context
+				success, gasUsed, err = gevm.SimulateNative(simPayload)
+				if err != nil || !success {
+					// FIXED: Pass worker lifecycle context down to the remote fallback call
+					success, gasUsed, err = gevm.SimulateWithBackend(ctx, cand, simPayload, execution.SimBackendRemote)
+				}
+			} else {
+				// FIXED: Pass worker lifecycle context down to the primary remote call
+				success, gasUsed, err = gevm.SimulateWithBackend(ctx, cand, simPayload, backend)
 			}
+
 
 			if err != nil || !success {
 				reverted := (err != nil && strings.Contains(err.Error(), "execution reverted"))
@@ -786,7 +786,7 @@ func worker2(
 	}
 }
 
-// worker3 – non-blocking send via goroutine with proper nonce handling
+// worker3 – fixed nonce race: sign synchronously, broadcast asynchronously
 func worker3(
 	ctx context.Context,
 	executionChan <-chan *types.ExecutionPayload,
@@ -804,24 +804,32 @@ func worker3(
 			nonce := nonceTracker.NextNonce()
 			payload.Nonce = nonce
 
-			// Fire‑and‑forget broadcast to avoid blocking the loop.
-			go func(p *types.ExecutionPayload, n uint64) {
-				rawTx, txHash, err := sender.PrepareAndSignTransaction(p)
-				if err != nil {
-					nonceTracker.Rollback()
-					msg := fmt.Sprintf("[-] DROP | Tx signing failed | Reason: %v", err)
-					log.Println(msg)
-					if dashServer != nil {
-						dashServer.Log(msg)
-						dashServer.SetTradeStatus("FAILED", err.Error())
-					}
-					putPayload(p)
-					return
+			// Sign synchronously to guarantee nonce order.
+			rawTx, txHash, err := sender.PrepareAndSignTransaction(payload)
+			if err != nil {
+				nonceTracker.Rollback()
+				msg := fmt.Sprintf("[-] DROP | Tx signing failed | Reason: %v", err)
+				log.Println(msg)
+				if dashServer != nil {
+					dashServer.Log(msg)
+					dashServer.SetTradeStatus("FAILED", err.Error())
 				}
+				putPayload(payload)
+				continue
+			}
 
-				err = sender.BroadcastRawTransactionBytes(rawTx)
+			log.Printf("[+] PENDING | Tx: %s | Profit: $%.2f | GasTip: %.3f Gwei | Route: %s",
+				txHash.Hex(),
+				payload.MinProfitUSD,
+				float64(payload.PriorityFeeWei)/1e9,
+				payload.RouteDesc,
+			)
+
+			// Broadcast asynchronously to avoid blocking the loop.
+			go func(raw []byte, p *types.ExecutionPayload, n uint64) {
+				err := sender.BroadcastRawTransactionBytes(raw)
 				if err != nil {
-					// Do NOT rollback nonce – transaction may have been sent.
+					// Do NOT rollback nonce – transaction may have been partially sent.
 					msg := fmt.Sprintf("[-] DROP | Tx broadcast failed | Reason: %v", err)
 					log.Println(msg)
 					if dashServer != nil {
@@ -831,16 +839,8 @@ func worker3(
 					putPayload(p)
 					return
 				}
-
-				log.Printf("[+] PENDING | Tx: %s | Profit: $%.2f | GasTip: %.3f Gwei | Route: %s",
-					txHash.Hex(),
-					p.MinProfitUSD,
-					float64(p.PriorityFeeWei)/1e9,
-					p.RouteDesc,
-				)
-
 				sender.RegisterPendingNonce(n, p)
-			}(payload, nonce)
+			}(rawTx, payload, nonce)
 		}
 	}
 }
