@@ -20,17 +20,16 @@ import (
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/ethclient"
 	"golang.org/x/sys/unix"
-	"github.com/ethereum/go-ethereum/accounts/abi"
-	"github.com/ethereum/go-ethereum/accounts/abi/bind"
+
 
 	"my-mev-bot/Bot/Config"
 	"my-mev-bot/Bot/Dashboard"
 	"my-mev-bot/Bot/Execution"
 	"my-mev-bot/Bot/Ingestion"
-	"my-mev-bot/Bot/PoolRegistry"
 	"my-mev-bot/Bot/Solver"
 	"my-mev-bot/Bot/State"
 	"my-mev-bot/Bot/Types"
+	"my-mev-bot/Bot/Gatekeeper"
 )
 
 const (
@@ -118,7 +117,7 @@ func main() {
 
 	matrix := state.NewMatrix()
 	blacklist := state.NewBlacklist()
-	lru := state.NewDynamicTokenCache()
+	lru := state.NewMemeTokenCache()
 
 	anchors := config.AnchorAssets()
 	anchorSet := make(map[common.Address]bool, len(anchors))
@@ -137,65 +136,9 @@ func main() {
 	}
 
 	matrix.SetEthClient(ethClient)
-
-	// ================================================================
-	// 1. Initialize PoolRegistry and fetch factory addresses from routers
-	// ================================================================
-	reg, err := poolregistry.New(cfg.BaseHTTPRPC)
-	if err != nil {
-		log.Fatalf("Failed to create pool registry: %v", err)
-	}
-	defer reg.Close()
-
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	if err := reg.EnsureFactories(ctx); err != nil {
-		log.Fatalf("Failed to fetch factory addresses: %v", err)
-	}
-	matrix.SetRegistry(reg)
-
-	feeTiers := []uint32{500, 3000, 10000}
-
-	for i := 0; i < len(anchors); i++ {
-		for j := i + 1; j < len(anchors); j++ {
-			tokenA := anchors[i]
-			tokenB := anchors[j]
-
-			for _, fee := range feeTiers {
-				poolAddr, err := reg.FetchAndCacheV3(reg.UniswapV3Factory(), tokenA, tokenB, fee)
-				if err != nil || poolAddr == (common.Address{}) {
-					continue
-				}
-				registerPoolFromRegistry(matrix, ethClient, poolAddr, types.DexUniswapV3, fee)
-			}
-
-			for _, fee := range feeTiers {
-				poolAddr, err := reg.FetchAndCacheV3(reg.PancakeV3Factory(), tokenA, tokenB, fee)
-				if err != nil || poolAddr == (common.Address{}) {
-					continue
-				}
-				registerPoolFromRegistry(matrix, ethClient, poolAddr, types.DexPancakeV3, fee)
-			}
-
-			poolAddr, err := reg.FetchAndCacheV2Standard(reg.AlienBaseV2Factory(), tokenA, tokenB)
-			if err == nil && poolAddr != (common.Address{}) {
-				registerPoolFromRegistry(matrix, ethClient, poolAddr, types.DexAlienBaseV2, 30)
-			}
-
-			poolAddr, err = reg.FetchAndCacheAerodromeV2(reg.AerodromeV2Factory(), tokenA, tokenB, false)
-			if err == nil && poolAddr != (common.Address{}) {
-				registerPoolFromRegistry(matrix, ethClient, poolAddr, types.DexAerodromeV2, 30)
-			}
-
-			poolAddr, err = reg.FetchAndCacheAerodromeV2(reg.AerodromeV2Factory(), tokenA, tokenB, true)
-			if err == nil && poolAddr != (common.Address{}) {
-				registerPoolFromRegistry(matrix, ethClient, poolAddr, types.DexAerodromeV2, 5)
-			}
-		}
-	}
-
-	log.Printf("[Main] Registered %d pools from registry", len(reg.GetAllPools()))
-	// ================================================================
+ctx, cancel := context.WithCancel(context.Background())
+defer cancel()
+// ================================================================
 
 	// ---- Create GEVMSimulator with WebSocket URL ----
 	gevm := execution.NewGEVMSimulator(cfg.BaseHTTPRPC, cfg.BaseWSRPC, ownerAddress)
@@ -219,6 +162,21 @@ func main() {
 		stateCache.SetCode(pool.PoolAddress, code)
 	}
 	gevm.SetStateCache(stateCache)
+	// Create the three LRU caches
+memeCache := lru // lru is already created as state.NewMemeTokenCache()
+dexCache := state.NewDEXFactoryCache()
+pairCache := state.NewBasePairCache()
+
+// Create the gatekeeper with background qualification workers
+gatekeeper := gatekeeper.New(
+    ethClient,
+    gevm,
+    memeCache, // same as lru
+    dexCache,
+    pairCache,
+    blacklist,
+    matrix,
+)
 
 	// ---- Start WebSocket‑based block context updater ----
 	gevm.StartWebSocketContextUpdater(ctx)
@@ -344,13 +302,8 @@ func main() {
 
 	statusChan := make(chan string, 1)
 
-	poolAddresses := reg.GetAllPools()
-	if len(poolAddresses) == 0 {
-		log.Fatal("No pools fetched – cannot subscribe to any swap events")
-	}
-	log.Printf("[Main] Subscribing to %d pool addresses", len(poolAddresses))
-
-	go ingestion.StartWebSocketReader(ctx, cfg.BaseWSRPC, eventChan, decoder, statusChan, poolAddresses)
+    log.Println("[Main] Subscribing to ALL swap events (dynamic discovery enabled)")
+  go ingestion.StartWebSocketReader(ctx, cfg.BaseWSRPC, eventChan, decoder, statusChan, nil)
 
 	go func() {
 		for status := range statusChan {
@@ -375,13 +328,13 @@ func main() {
 	}
 
 	wg.Add(1)
-	go func() {
-		if cfg.EnableCPUPinning {
-			pinToCore(cores[0])
-		}
-		defer wg.Done()
-		worker1(ctx, eventChan, candidateChan, matrix, blacklist, lru, anchorSet, cfg)
-	}()
+go func() {
+    if cfg.EnableCPUPinning {
+        pinToCore(cores[0])
+    }
+    defer wg.Done()
+    worker1(ctx, eventChan, candidateChan, matrix, blacklist, lru, anchorSet, cfg, gatekeeper)
+}()
 
 	for i := 0; i < numSimWorkers; i++ {
 		wg.Add(1)
@@ -425,67 +378,6 @@ func main() {
 	log.Println("Bot stopped.")
 }
 
-// registerPoolFromRegistry fetches token0/token1 from the pool and registers it in the matrix.
-func registerPoolFromRegistry(matrix *state.Matrix, client *ethclient.Client, poolAddr common.Address, dexType types.DexType, feeBps uint32) {
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-
-	token0, err := callToken0(ctx, client, poolAddr)
-	if err != nil {
-		log.Printf("Failed to get token0 for pool %s: %v", poolAddr.Hex(), err)
-		return
-	}
-	token1, err := callToken1(ctx, client, poolAddr)
-	if err != nil {
-		log.Printf("Failed to get token1 for pool %s: %v", poolAddr.Hex(), err)
-		return
-	}
-
-	pool := &types.PoolState{
-		PoolAddress:  poolAddr,
-		Token0:       token0,
-		Token1:       token1,
-		DexType:      dexType,
-		FeeBps:       feeBps,
-		Reserve0:     new(big.Int),
-		Reserve1:     new(big.Int),
-		SqrtPriceX96: new(big.Int),
-		Liquidity:    new(big.Int),
-	}
-	matrix.RegisterPool(pool)
-}
-
-// Helper to call token0() on a pool.
-func callToken0(ctx context.Context, client *ethclient.Client, pool common.Address) (common.Address, error) {
-	const token0ABI = `[{"type":"function","name":"token0","inputs":[],"outputs":[{"type":"address"}]}]`
-	parsed, _ := abi.JSON(strings.NewReader(token0ABI))
-	contract := bind.NewBoundContract(pool, parsed, client, client, client)
-	var out []interface{}
-	err := contract.Call(&bind.CallOpts{Context: ctx}, &out, "token0")
-	if err != nil {
-		return common.Address{}, err
-	}
-	if len(out) == 0 {
-		return common.Address{}, fmt.Errorf("no output")
-	}
-	return out[0].(common.Address), nil
-}
-
-// Helper to call token1() on a pool.
-func callToken1(ctx context.Context, client *ethclient.Client, pool common.Address) (common.Address, error) {
-	const token1ABI = `[{"type":"function","name":"token1","inputs":[],"outputs":[{"type":"address"}]}]`
-	parsed, _ := abi.JSON(strings.NewReader(token1ABI))
-	contract := bind.NewBoundContract(pool, parsed, client, client, client)
-	var out []interface{}
-	err := contract.Call(&bind.CallOpts{Context: ctx}, &out, "token1")
-	if err != nil {
-		return common.Address{}, err
-	}
-	if len(out) == 0 {
-		return common.Address{}, fmt.Errorf("no output")
-	}
-	return out[0].(common.Address), nil
-}
 
 // ---------------------------------------------------------------------
 // Worker functions
@@ -497,9 +389,10 @@ func worker1(
 	candidateChan chan<- *types.RouteCandidate,
 	matrix *state.Matrix,
 	blacklist *state.Blacklist,
-	lru *state.DynamicTokenCache,
+	lru *state.LRUCache,
 	anchorSet map[common.Address]bool,
 	cfg *config.Config,
+	gatekeeper *gatekeeper.Gatekeeper,
 ) {
 	var localCandidates [maxCandidatesPerEvent]*types.RouteCandidate
 	candidateCount := 0
@@ -513,17 +406,29 @@ func worker1(
 				return
 			}
 
+			// ---- NEW: Gatekeeper Integration ----
+			// Check if pool exists in matrix
+			pool := matrix.GetPool(swapLog.Address)
+			if pool == nil {
+				// Unknown pool – offload discovery to gatekeeper (non‑blocking)
+				gatekeeper.ProcessLog(swapLog)
+				ingestion.PutSwapLog(swapLog)
+				continue
+			}
+			// ---- End Gatekeeper Integration ----
+
+			// Known pool – update state
 			matrix.UpdateFromLog(swapLog)
 
 			// Ensure TokenIn/TokenOut are set
 			if swapLog.TokenIn == (common.Address{}) || swapLog.TokenOut == (common.Address{}) {
-				pool := matrix.GetPool(swapLog.Address)
 				if pool != nil {
 					swapLog.TokenIn = pool.Token0
 					swapLog.TokenOut = pool.Token1
 				}
 			}
 
+			// Copy log for retry context
 			lastLogMu.Lock()
 			copyLog := &types.SwapLog{
 				Address:          swapLog.Address,
@@ -548,6 +453,7 @@ func worker1(
 			lastSwapLog = copyLog
 			lastLogMu.Unlock()
 
+			// Evaluate candidates
 			candidates := solver.EvaluateEvent(swapLog, matrix, cfg)
 			candidateCount = 0
 			for _, cand := range candidates {
@@ -572,6 +478,7 @@ func worker1(
 				}
 			}
 
+			// Send candidates to channel
 			for i := 0; i < candidateCount; i++ {
 				select {
 				case candidateChan <- localCandidates[i]:
@@ -579,6 +486,7 @@ func worker1(
 				}
 			}
 
+			// Update LRU cache with new tokens
 			tokensToTrack := []common.Address{swapLog.TokenIn, swapLog.TokenOut}
 			for _, cand := range candidates {
 				for _, tok := range cand.Tokens {
@@ -591,6 +499,7 @@ func worker1(
 				}
 			}
 
+			// Return log to pool
 			ingestion.PutSwapLog(swapLog)
 		}
 	}
