@@ -225,12 +225,8 @@ func main() {
 
 	// ---- Removed Anvil health checks and background ticker ----
 
-	execEndpoint := cfg.BaseExecRPC
-	if execEndpoint == "" {
-		execEndpoint = cfg.BaseHTTPRPC
-	}
 
-	sender, err := execution.NewSender(cfg.BaseHTTPRPC, execEndpoint, cfg.PrivateKey)
+	sender, err := execution.NewSender(cfg.BaseHTTPRPC,  cfg.PrivateKey)
 	if err != nil {
 		log.Fatalf("Failed to initialize sender: %v", err)
 	}
@@ -716,15 +712,15 @@ func worker2(
 			var success bool
 			var gasUsed uint64
 
-			if backend == execution.SimBackendLocal {
-				// Use context with timeout and cancel immediately to avoid memory leak
-				subCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-				success, gasUsed, err = gevm.SimulateNative(simPayload)
-				cancel() // immediate cleanup
-				if err != nil || !success {
-					success, gasUsed, err = gevm.SimulateWithBackend(cand, simPayload, execution.SimBackendRemote)
-				}
-			} else {
+		if backend == execution.SimBackendLocal {
+    // Use context with timeout and cancel immediately to avoid memory leak
+    _, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+    success, gasUsed, err = gevm.SimulateNative(simPayload)
+    cancel()
+    if err != nil || !success {
+        success, gasUsed, err = gevm.SimulateWithBackend(cand, simPayload, execution.SimBackendRemote)
+    }
+}else {
 				success, gasUsed, err = gevm.SimulateWithBackend(cand, simPayload, backend)
 			}
 
@@ -808,11 +804,24 @@ func worker3(
 			nonce := nonceTracker.NextNonce()
 			payload.Nonce = nonce
 
-			// Fire-and-forget broadcast to avoid blocking the loop.
+			// Fire‑and‑forget broadcast to avoid blocking the loop.
 			go func(p *types.ExecutionPayload, n uint64) {
-				txHash, err := sender.SendRawTransaction(p)
+				rawTx, txHash, err := sender.PrepareAndSignTransaction(p)
 				if err != nil {
 					nonceTracker.Rollback()
+					msg := fmt.Sprintf("[-] DROP | Tx signing failed | Reason: %v", err)
+					log.Println(msg)
+					if dashServer != nil {
+						dashServer.Log(msg)
+						dashServer.SetTradeStatus("FAILED", err.Error())
+					}
+					putPayload(p)
+					return
+				}
+
+				err = sender.BroadcastRawTransactionBytes(rawTx)
+				if err != nil {
+					// Do NOT rollback nonce – transaction may have been sent.
 					msg := fmt.Sprintf("[-] DROP | Tx broadcast failed | Reason: %v", err)
 					log.Println(msg)
 					if dashServer != nil {
