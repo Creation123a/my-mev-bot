@@ -14,6 +14,7 @@ import (
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/ethclient"
 )
+
 var (
 	UniswapV3Router   = common.HexToAddress("0x2626664c2603336E57B271c5C0b26F421741e481")
 	PancakeV3Router   = common.HexToAddress("0x1b81D678ffb9C0263b24A97847620C99d213eB14")
@@ -29,9 +30,10 @@ type PoolKey struct {
 }
 
 type PoolRegistry struct {
-	client      *ethclient.Client
-	cache       sync.Map
-	factoryMu   sync.RWMutex
+	client *ethclient.Client
+	cache  sync.Map
+
+	// Factory addresses – set once at startup, never change.
 	uniswapV3   common.Address
 	pancakeV3   common.Address
 	aerodromeV2 common.Address
@@ -47,7 +49,7 @@ func New(rpcURL string) (*PoolRegistry, error) {
 	return &PoolRegistry{client: client}, nil
 }
 
-// Safely sort addresses alphabetically to prevent duplicate entries (fixes Bug #3)
+// sortTokens alphabetically to prevent duplicate cache entries.
 func sortTokens(a, b common.Address) (string, string) {
 	aStr := strings.ToLower(a.Hex())
 	bStr := strings.ToLower(b.Hex())
@@ -56,71 +58,87 @@ func sortTokens(a, b common.Address) (string, string) {
 	}
 	return bStr, aStr
 }
+
+// EnsureFactories fetches factory addresses from routers.
+// This must be called once at startup before any pool fetching.
 func (pr *PoolRegistry) EnsureFactories(ctx context.Context) error {
-    pr.factoryMu.Lock()
-    defer pr.factoryMu.Unlock()
-    if pr.fetched {
-        return nil
-    }
+	if pr.fetched {
+		return nil
+	}
 
-    // Standard factory method ABI (works for Uniswap V3, Pancake V3, AlienBase V2, and Aerodrome Slipstream)
-    const factoryABI = `[{"inputs":[],"name":"factory","outputs":[{"internalType":"address","name":"","type":"address"}],"stateMutability":"view","type":"function"}]`
-    parsed, err := abi.JSON(strings.NewReader(factoryABI))
-    if err != nil {
-        return fmt.Errorf("parse factory ABI: %w", err)
-    }
+	// Standard factory method ABI (Uniswap V3, Pancake V3, AlienBase V2)
+// Updated ABI string to include BOTH valid method signatures
+	const factoryABI = `[
+		{"inputs":[],"name":"factory","outputs":[{"internalType":"address","name":"","type":"address"}],"stateMutability":"view","type":"function"},
+		{"inputs":[],"name":"poolFactory","outputs":[{"internalType":"address","name":"","type":"address"}],"stateMutability":"view","type":"function"}
+	]`
+	parsed, err := abi.JSON(strings.NewReader(factoryABI))
+	if err != nil {
+		return fmt.Errorf("parse factory ABI: %w", err)
+	}
 
-    fetchMethod := func(router common.Address, methodName string) (common.Address, error) {
-        contract := bind.NewBoundContract(router, parsed, pr.client, pr.client, pr.client)
-        var out []interface{}
-        subCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
-        defer cancel()
-        err := contract.Call(&bind.CallOpts{Context: subCtx}, &out, methodName)
-        if err != nil {
-            return common.Address{}, err
-        }
-        if len(out) == 0 {
-            return common.Address{}, fmt.Errorf("empty response")
-        }
-        return out[0].(common.Address), nil
-    }
+	// Helper to call a method on a router with a timeout.
+	fetchMethod := func(router common.Address, methodName string) (common.Address, error) {
+		contract := bind.NewBoundContract(router, parsed, pr.client, pr.client, pr.client)
+		var out []interface{}
+		subCtx, cancel := context.WithTimeout(ctx, 5*time.Second) // increased timeout for reliability
+		defer cancel()
+		err := contract.Call(&bind.CallOpts{Context: subCtx}, &out, methodName)
+		if err != nil {
+			return common.Address{}, err
+		}
+		if len(out) == 0 {
+			return common.Address{}, fmt.Errorf("empty response")
+		}
+		return out[0].(common.Address), nil
+	}
 
-    if addr, err := fetchMethod(UniswapV3Router, "factory"); err == nil {
-        pr.uniswapV3 = addr
-    } else {
-        return fmt.Errorf("uni v3 rpc drop: %w", err)
-    }
+	// Uniswap V3
+	if addr, err := fetchMethod(UniswapV3Router, "factory"); err == nil {
+		pr.uniswapV3 = addr
+	} else {
+		return fmt.Errorf("uni v3 rpc drop: %w", err)
+	}
 
-    if addr, err := fetchMethod(PancakeV3Router, "factory"); err == nil {
-        pr.pancakeV3 = addr
-    } else {
-        return fmt.Errorf("pancake v3 rpc drop: %w", err)
-    }
+	// Pancake V3
+	if addr, err := fetchMethod(PancakeV3Router, "factory"); err == nil {
+		pr.pancakeV3 = addr
+	} else {
+		return fmt.Errorf("pancake v3 rpc drop: %w", err)
+	}
 
-    if addr, err := fetchMethod(AlienBaseV2Router, "factory"); err == nil {
-        pr.alienBaseV2 = addr
-    } else {
-        return fmt.Errorf("alienbase v2 rpc drop: %w", err)
-    }
+	// AlienBase V2
+	if addr, err := fetchMethod(AlienBaseV2Router, "factory"); err == nil {
+		pr.alienBaseV2 = addr
+	} else {
+		return fmt.Errorf("alienbase v2 rpc drop: %w", err)
+	}
 
-    // Aerodrome Slipstream uses standard "factory" method
-    if addr, err := fetchMethod(AerodromeV2Router, "factory"); err == nil {
-        pr.aerodromeV2 = addr
-    } else {
-        // Fallback to known Aerodrome factory address if RPC fails
-        pr.aerodromeV2 = common.HexToAddress("0x420dd381b31aef6683db6b902084cb0ffece40da")
-        log.Printf("[PoolRegistry] Aerodrome factory fetch failed, using fallback address")
-    }
+	// Aerodrome Slipstream – try "factory" first; fallback to known address if it fails.
+	if addr, err := fetchMethod(AerodromeV2Router, "factory"); err == nil {
+		pr.aerodromeV2 = addr
+	} else {
+		// Some versions use "poolFactory"; try it as a fallback.
+		if addr, err := fetchMethod(AerodromeV2Router, "poolFactory"); err == nil {
+			pr.aerodromeV2 = addr
+		} else {
+			// Known Aerodrome factory address (correct for Base mainnet).
+			pr.aerodromeV2 = common.HexToAddress("0x420dd381b31aef6683db6b902084cb0ffece40da")
+			log.Printf("[PoolRegistry] Aerodrome factory fetch failed, using fallback address")
+		}
+	}
 
-    pr.fetched = true
-    return nil
+	pr.fetched = true
+	return nil
 }
 
-func (pr *PoolRegistry) UniswapV3Factory() common.Address   { pr.factoryMu.RLock(); defer pr.factoryMu.RUnlock(); return pr.uniswapV3 }
-func (pr *PoolRegistry) PancakeV3Factory() common.Address   { pr.factoryMu.RLock(); defer pr.factoryMu.RUnlock(); return pr.pancakeV3 }
-func (pr *PoolRegistry) AerodromeV2Factory() common.Address { pr.factoryMu.RLock(); defer pr.factoryMu.RUnlock(); return pr.aerodromeV2 }
-func (pr *PoolRegistry) AlienBaseV2Factory() common.Address { pr.factoryMu.RLock(); defer pr.factoryMu.RUnlock(); return pr.alienBaseV2 }
+// Factory getters – no locks needed because these are immutable after startup.
+func (pr *PoolRegistry) UniswapV3Factory() common.Address   { return pr.uniswapV3 }
+func (pr *PoolRegistry) PancakeV3Factory() common.Address   { return pr.pancakeV3 }
+func (pr *PoolRegistry) AerodromeV2Factory() common.Address { return pr.aerodromeV2 }
+func (pr *PoolRegistry) AlienBaseV2Factory() common.Address { return pr.alienBaseV2 }
 
+// FetchAndCacheV3 retrieves a V3 pool address from the factory.
 func (pr *PoolRegistry) FetchAndCacheV3(factory, tokenA, tokenB common.Address, fee uint32) (common.Address, error) {
 	t0, t1 := sortTokens(tokenA, tokenB)
 	key := PoolKey{TokenA: t0, TokenB: t1, Fee: fee, Stable: false}
@@ -135,7 +153,7 @@ func (pr *PoolRegistry) FetchAndCacheV3(factory, tokenA, tokenB common.Address, 
 	}
 	contract := bind.NewBoundContract(factory, parsedABI, pr.client, pr.client, pr.client)
 	var out []interface{}
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	err = contract.Call(&bind.CallOpts{Context: ctx}, &out, "getPool", common.HexToAddress(t0), common.HexToAddress(t1), fee)
 	if err != nil {
@@ -149,7 +167,7 @@ func (pr *PoolRegistry) FetchAndCacheV3(factory, tokenA, tokenB common.Address, 
 	return poolAddr, nil
 }
 
-// FetchAndCacheV2Standard tracks standard forks (AlienBase V2)
+// FetchAndCacheV2Standard fetches a V2 pool via getPair (AlienBase V2).
 func (pr *PoolRegistry) FetchAndCacheV2Standard(factory, tokenA, tokenB common.Address) (common.Address, error) {
 	t0, t1 := sortTokens(tokenA, tokenB)
 	key := PoolKey{TokenA: t0, TokenB: t1, Fee: 0, Stable: false}
@@ -164,7 +182,7 @@ func (pr *PoolRegistry) FetchAndCacheV2Standard(factory, tokenA, tokenB common.A
 	}
 	contract := bind.NewBoundContract(factory, parsedABI, pr.client, pr.client, pr.client)
 	var out []interface{}
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	err = contract.Call(&bind.CallOpts{Context: ctx}, &out, "getPair", common.HexToAddress(t0), common.HexToAddress(t1))
 	if err != nil {
@@ -178,7 +196,7 @@ func (pr *PoolRegistry) FetchAndCacheV2Standard(factory, tokenA, tokenB common.A
 	return poolAddr, nil
 }
 
-// FetchAndCacheAerodromeV2 resolves custom Aerodrome pool properties (Fixes Bug #2)
+// FetchAndCacheAerodromeV2 fetches an Aerodrome V2 pool with stable flag.
 func (pr *PoolRegistry) FetchAndCacheAerodromeV2(factory, tokenA, tokenB common.Address, stable bool) (common.Address, error) {
 	t0, t1 := sortTokens(tokenA, tokenB)
 	key := PoolKey{TokenA: t0, TokenB: t1, Fee: 0, Stable: stable}
@@ -193,7 +211,7 @@ func (pr *PoolRegistry) FetchAndCacheAerodromeV2(factory, tokenA, tokenB common.
 	}
 	contract := bind.NewBoundContract(factory, parsedABI, pr.client, pr.client, pr.client)
 	var out []interface{}
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	err = contract.Call(&bind.CallOpts{Context: ctx}, &out, "getPool", common.HexToAddress(t0), common.HexToAddress(t1), stable)
 	if err != nil {
@@ -227,5 +245,7 @@ func (pr *PoolRegistry) GetAllPools() []common.Address {
 }
 
 func (pr *PoolRegistry) Close() {
-	if pr.client != nil { pr.client.Close() }
+	if pr.client != nil {
+		pr.client.Close()
+	}
 }
