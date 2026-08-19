@@ -166,7 +166,6 @@ defer cancel()
 memeCache := lru // lru is already created as state.NewMemeTokenCache()
 dexCache := state.NewDEXFactoryCache()
 pairCache := state.NewBasePairCache()
-
 // Create the gatekeeper with background qualification workers
 gatekeeper := gatekeeper.New(
     ethClient,
@@ -177,6 +176,7 @@ gatekeeper := gatekeeper.New(
     blacklist,
     matrix,
 )
+
 
 	// ---- Start WebSocket‑based block context updater ----
 	gevm.StartWebSocketContextUpdater(ctx)
