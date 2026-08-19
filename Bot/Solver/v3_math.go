@@ -67,11 +67,17 @@ func (c *V3Calculator) ComputeSwap(pool *types.PoolState, tokenIn, tokenOut comm
 		return fmt.Errorf("zero liquidity")
 	}
 	feeBps := pool.FeeBps
+
+	// FIX: Normalise fee to pips if it's stored as basis points (<=100).
+	// Uniswap V3 fees are in pips (e.g., 500, 3000, 10000).
+	if feeBps <= 100 {
+		feeBps = feeBps * 100
+	}
 	if feeBps >= 10000 {
 		feeBps = 9999
 	}
 	if feeBps == 0 {
-		feeBps = 30
+		feeBps = 3000 // default 0.3% pips
 	}
 
 	feeDenominator := big.NewInt(1000000)
