@@ -168,17 +168,24 @@ func (s *Sender) BroadcastRawTransactionBytes(rawTx []byte) error {
 			return err
 		}
 	}
-
-	// Register pending for confirmation tracking.
-	s.pendingMu.Lock()
-	s.pending[nonce] = &PendingTx{
-		Nonce:   nonce,
-		Hash:    txHash,
-		SentAt:  time.Now(),
-		Payload: nil, // Will be set by RegisterPendingNonce from worker3
-		Checked: false,
-	}
-	s.pendingMu.Unlock()
+// Register pending for confirmation tracking, preserving existing payload if present.
+s.pendingMu.Lock()
+pending, exists := s.pending[nonce]
+if !exists {
+    s.pending[nonce] = &PendingTx{
+        Nonce:   nonce,
+        Hash:    txHash,
+        SentAt:  time.Now(),
+        Payload: nil,
+        Checked: false,
+    }
+} else {
+    // Update existing entry without wiping Payload
+    pending.Hash = txHash
+    pending.SentAt = time.Now()
+    pending.Checked = false
+}
+s.pendingMu.Unlock()
 
 	go s.monitorConfirmation(nonce)
 	return nil
