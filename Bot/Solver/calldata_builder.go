@@ -137,12 +137,14 @@ func BuildCalldata(
 
 	// Build route struct
 	type RouteData struct {
-		Pools        []common.Address
-		DexTypes     []uint8
-		ZeroForOnes  []bool
-		MinOuts      []*big.Int
-		AmountIn     *big.Int
-	}
+    Pools       []common.Address
+    Tokens      []common.Address // length = Hops + 1
+    DexTypes    []uint8
+    ZeroForOnes []bool
+    MinOuts     []*big.Int
+    FeeBps      []uint32 // length = Hops
+    AmountIn    *big.Int
+}
 	route := RouteData{
 		Pools:       cand.Pools[:n],
 		DexTypes:    dexTypes,
