@@ -788,7 +788,7 @@ func (t *Tracker) updateMorphoPosition(ctx context.Context, user common.Address)
 	if len(results) < 3 {
 		return
 	}
-	supply := results[0].(*big.Int)
+
 	borrow := results[1].(*big.Int)
 	collateral := results[2].(*big.Int)
 
@@ -929,7 +929,6 @@ func (t *Tracker) updateExactlyPosition(ctx context.Context, user common.Address
 
 	// 3. Determine collateral and debt markets
 	collateralMarket := markets[0]
-	debtMarket := markets[0]
 
 	// For this implementation, we assume the market is for USDC/WETH.
 	collateralAsset :=  config.WETHAddress
@@ -1370,16 +1369,24 @@ func packLiquidationData(protocol uint8, args ...interface{}) []byte {
 		}
 	case ProtocolMorpho:
     arguments = abi.Arguments{
-        {Type: mustParseType("tuple"), Name: "params", Components: []abi.ArgumentMarshaling{
-            {Name: "loanToken", Type: "address"},
-            {Name: "collateralToken", Type: "address"},
-            {Name: "oracle", Type: "address"},
-            {Name: "irm", Type: "address"},      // <-- ADDED THIS
-            {Name: "lltv", Type: "uint256"},     // <-- RENAMED from liquidationThreshold
-        }},
-        {Type: mustParseType("address"), Name: "borrower"},
-        {Type: mustParseType("uint256"), Name: "seizedAssets"},
-        {Type: mustParseType("uint256"), Name: "maxRepay"},
+        // Define the tuple type with components using NewType
+tupleType, err := abi.NewType("tuple", "", []abi.ArgumentMarshaling{
+    {Name: "loanToken", Type: "address"},
+    {Name: "collateralToken", Type: "address"},
+    {Name: "oracle", Type: "address"},
+    {Name: "irm", Type: "address"},
+    {Name: "lltv", Type: "uint256"},
+})
+if err != nil {
+    log.Printf("Failed to create tuple type: %v", err)
+    return nil
+}
+arguments = abi.Arguments{
+    {Type: tupleType, Name: "params"},
+    {Type: mustParseType("address"), Name: "borrower"},
+    {Type: mustParseType("uint256"), Name: "seizedAssets"},
+    {Type: mustParseType("uint256"), Name: "maxRepay"},
+}
     }
 	case ProtocolExactly:
 		arguments = abi.Arguments{
