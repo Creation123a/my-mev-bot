@@ -69,7 +69,7 @@ func (pll *FlashblockPLL) MeasureRTT(ctx context.Context, client *ethclient.Clie
             min = v
         }
     }
-    atomic.StoreInt64(&pll.measuredRTTNano, min)
+    pll.measuredRTTNano.Store(min)
     return nil
 }
 
@@ -201,7 +201,8 @@ func PredictV3PostState(
 	// For V3, reserve0 ≈ liquidity / sqrtPrice, reserve1 ≈ liquidity * sqrtPrice
 	// We use big.Float for precision, but to keep it in big.Int we scale.
 	const Q96 = 79228162514264337593543950336 // 2^96
-	Q96big := new(big.Int).SetUint64(Q96)
+Q96big := new(big.Int)
+Q96big.SetString("79228162514264337593543950336", 10)
 
 	// Compute virtual reserves in wei (scaled by Q96)
 	// reserve0 = liquidity * Q96 / sqrtPrice
@@ -211,7 +212,8 @@ func PredictV3PostState(
 	// We'll use big.Float for the math and then convert back.
 	sqrtF := new(big.Float).SetInt(sqrtPrice)
 	liqF := new(big.Float).SetInt(liquidity)
-	q96F := new(big.Float).SetUint64(Q96)
+	q96F := new(big.Float)
+q96F.SetString("79228162514264337593543950336")
 
 	// reserve0 = liquidity / sqrtPrice (in token0 units)
 	reserve0F := new(big.Float).Quo(liqF, sqrtF) // roughly
@@ -266,10 +268,10 @@ func PredictV3PostState(
 	// sqrtPrice is in Q96 format: sqrtPrice = sqrt(price) * 2^96
 	// We need to multiply newSqrtF by Q96
 	newSqrtF.Mul(newSqrtF, q96F)
-	sqrtOut, _ := newSqrtF.Int(sqrtOut)
+	sqrtOut, _ = newSqrtF.Int(sqrtOut)
 
 	// Liquidity is in wei, we can directly convert newLiqF
-	liqOut, _ := newLiqF.Int(liqOut)
+	liqOut, _ = newLiqF.Int(liqOut)
 
 	return sqrtOut, liqOut
 }
