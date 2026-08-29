@@ -24,16 +24,12 @@ var (
 	ErrSwapExecutionFailedSelector = common.HexToHash("0x446da0c9").Bytes()[:4]
 	ErrLoanRepaymentFailedSelector = common.HexToHash("0x09d6f424").Bytes()[:4]
 )
-// executeSelector is computed from the actual Solidity function signature:
-// executeArbitrage(uint8,address,address,uint256,(address[],uint8[],bool[],uint256[],uint256),uint256,uint256)
+
 var executeSelector [4]byte
 var arbABI *abi.ABI
 
 // InitExecutorABI ensures the ABI is ready.
-// Safe to call multiple times. Currently just forces the init() to run.
 func InitExecutorABI() error {
-	// The real work is done in init(). This function exists so main.go
-	// can call it and fail early if something went wrong during package init.
 	if arbABI == nil {
 		return fmt.Errorf("executor ABI failed to initialize")
 	}
@@ -44,7 +40,8 @@ func InitExecutorABI() error {
 }
 
 func init() {
-	// Define the ABI for the executeArbitrage function
+	// Define the ABI for the executeArbitrage function.
+	// Updated to include 'tokens' and 'feeBps' in RouteData.
 	parsed, err := abi.JSON(strings.NewReader(`[
 		{
 			"type": "function",
@@ -59,9 +56,11 @@ func init() {
 					"type": "tuple",
 					"components": [
 						{"name": "pools", "type": "address[]"},
+						{"name": "tokens", "type": "address[]"},
 						{"name": "dexTypes", "type": "uint8[]"},
 						{"name": "zeroForOnes", "type": "bool[]"},
 						{"name": "minOuts", "type": "uint256[]"},
+						{"name": "feeBps", "type": "uint256[]"},
 						{"name": "amountIn", "type": "uint256"}
 					]
 				},
@@ -75,7 +74,6 @@ func init() {
 		panic(fmt.Sprintf("failed to parse ABI: %v", err))
 	}
 	arbABI = &parsed
-	// Compute selector from the ABI
 	hash := arbABI.Methods["executeArbitrage"].ID
 	copy(executeSelector[:], hash[:4])
 }
@@ -118,7 +116,7 @@ func BuildCalldata(
 		}
 	}
 
-	// Validate deadline: must be in the future.
+	// Validate deadline.
 	if deadline <= uint64(time.Now().Unix()) {
 		return nil, fmt.Errorf("deadline %d is not in the future", deadline)
 	}
@@ -135,21 +133,30 @@ func BuildCalldata(
 		zeroForOnes[i] = cand.ZeroForOnes[i]
 	}
 
-	// Build route struct
+	// Build feeBps as []*big.Int (uint256[])
+	feeBps := make([]*big.Int, n)
+	for i := 0; i < n; i++ {
+		feeBps[i] = new(big.Int).SetUint64(uint64(cand.FeeBps[i]))
+	}
+
+	// RouteData struct must match the Solidity struct exactly.
 	type RouteData struct {
-    Pools       []common.Address
-    Tokens      []common.Address // length = Hops + 1
-    DexTypes    []uint8
-    ZeroForOnes []bool
-    MinOuts     []*big.Int
-    FeeBps      []uint32 // length = Hops
-    AmountIn    *big.Int
-}
+		Pools       []common.Address
+		Tokens      []common.Address // full token path
+		DexTypes    []uint8
+		ZeroForOnes []bool
+		MinOuts     []*big.Int
+		FeeBps      []*big.Int // fee in basis points (uint256)
+		AmountIn    *big.Int
+	}
+
 	route := RouteData{
 		Pools:       cand.Pools[:n],
+		Tokens:      cand.Tokens[:n+1], // full path
 		DexTypes:    dexTypes,
 		ZeroForOnes: zeroForOnes,
 		MinOuts:     cand.MinOuts[:n],
+		FeeBps:      feeBps,
 		AmountIn:    cand.AmountIn,
 	}
 
