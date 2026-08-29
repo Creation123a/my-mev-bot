@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -30,6 +31,9 @@ type DashboardServer struct {
 	lastExecMs    float64
 	token         string // required auth token
 }
+
+// botRunning indicates whether the bot is active (1 = running, 0 = paused).
+var BotRunning int32 = 1
 
 func NewDashboardServer() *DashboardServer {
 	token := os.Getenv("DASHBOARD_TOKEN")
@@ -123,31 +127,28 @@ func (d *DashboardServer) broadcastPayload(p StatusPayload) {
 }
 
 // Start runs the dashboard HTTP server with timeouts, private mux, loopback binding,
-// and required token authentication.
 func (d *DashboardServer) Start(addr string) error {
-	// Require a non-empty token for authentication.
-	if d.token == "" {
-		return fmt.Errorf("DASHBOARD_TOKEN must be set for dashboard authentication")
-	}
+    if d.token == "" {
+        return fmt.Errorf("DASHBOARD_TOKEN must be set for dashboard authentication")
+    }
 
-	go d.broadcaster()
+    go d.broadcaster()
 
-	// Force loopback binding for security, unless the caller explicitly uses another address.
-	if addr == ":8080" {
-		addr = "127.0.0.1:8080"
-	}
+    if addr == ":8080" {
+        addr = "127.0.0.1:8080"
+    }
 
-	mux := http.NewServeMux()
-	mux.HandleFunc("/events", d.authMiddleware(d.handleSSE))
-	mux.HandleFunc("/", d.authMiddleware(d.handleUI))
+    mux := http.NewServeMux()
+    mux.HandleFunc("/events", d.authMiddleware(d.handleSSE))
+    mux.HandleFunc("/", d.authMiddleware(d.handleUI))
+    mux.HandleFunc("/control", d.authMiddleware(d.handleControl)) // <-- ADD THIS LINE
 
-	srv := &http.Server{
-		Addr:              addr,
-		Handler:           mux,
-		ReadHeaderTimeout: 5 * time.Second,
-		// WriteTimeout intentionally left zero for SSE long-polling.
-	}
-	return srv.ListenAndServe()
+    srv := &http.Server{
+        Addr:              addr,
+        Handler:           mux,
+        ReadHeaderTimeout: 5 * time.Second,
+    }
+    return srv.ListenAndServe()
 }
 
 // authMiddleware checks for a valid token in the "token" query parameter.
@@ -241,13 +242,28 @@ func (d *DashboardServer) handleUI(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/html")
 	w.Write([]byte(htmlTemplate))
 }
+// handleControl toggles the bot running state.
+// It expects a query parameter `action=start` or `action=stop`.
+func (d *DashboardServer) handleControl(w http.ResponseWriter, r *http.Request) {
+    action := r.URL.Query().Get("action")
+    if action == "stop" {
+        atomic.StoreInt32(&BotRunning, 0)   // <-- change to &BotRunning
+    } else if action == "start" {
+        atomic.StoreInt32(&BotRunning, 1)
+    } else {
+        http.Error(w, "invalid action", http.StatusBadRequest)
+        return
+    }
+    w.Header().Set("Content-Type", "application/json")
+    w.Write([]byte(`{"status":"ok"}`))
+}
 
-const htmlTemplate = `<!DOCTYPE html>
+const htmlTemplate = <!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>⚡ MEV Bot Control Dashboard</title>
+    <title>⚡Control Panel</title>
     <style>
         * { box-sizing: border-box; margin: 0; padding: 0; }
         body { background-color: #0b0e14; color: #c9d1d9; font-family: 'JetBrains Mono', monospace, sans-serif; padding: 20px; }
@@ -272,9 +288,16 @@ const htmlTemplate = `<!DOCTYPE html>
 <body>
 
     <div class="header">
-        <div class="title">⚡ BASE MEV BOT</div>
+        <div class="title"> Hypervision Alpha 🎀✨</div>
         <div id="connStatus" class="status-badge">🔴 Disconnected</div>
     </div>
+    
+    
+<div style="display: flex; gap: 10px;">
+    <button id="startBtn" style="background: #238636; border: none; color: white; padding: 6px 16px; border-radius: 6px; cursor: pointer;">▶ Start</button>
+    <button id="stopBtn" style="background: #da3633; border: none; color: white; padding: 6px 16px; border-radius: 6px; cursor: pointer;">⏹ Stop</button>
+</div>
+
 
     <div class="metrics-grid">
         <div class="card">
@@ -299,6 +322,19 @@ const htmlTemplate = `<!DOCTYPE html>
         const token = new URLSearchParams(window.location.search).get("token");
         const evtSource = new EventSource("/events" + (token ? "?token=" + encodeURIComponent(token) : ""));
         const logsDiv = document.getElementById("logs");
+
+document.getElementById("startBtn").addEventListener("click", () => {
+    fetch("/control?action=start&token=" + encodeURIComponent(token))
+        .then(r => r.json())
+        .then(data => console.log(data));
+});
+
+document.getElementById("stopBtn").addEventListener("click", () => {
+    fetch("/control?action=stop&token=" + encodeURIComponent(token))
+        .then(r => r.json())
+        .then(data => console.log(data));
+});
+
 
         evtSource.onmessage = function(event) {
             try {
@@ -335,4 +371,4 @@ const htmlTemplate = `<!DOCTYPE html>
         };
     </script>
 </body>
-</html>`
+</html>
