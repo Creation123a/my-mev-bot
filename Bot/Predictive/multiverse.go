@@ -77,6 +77,22 @@ func SeedNextSubBlockBranches(
 		}
 		return common.Address{}, common.Address{}, false
 	}
+formatRoute := func(cand *types.RouteCandidate) string {
+		if cand == nil || cand.Hops == 0 {
+			return "unknown"
+		}
+		tokens := cand.Tokens[:int(cand.Hops)+1]
+		dexes := cand.DexTypes[:int(cand.Hops)]
+		route := ""
+		for i := 0; i < int(cand.Hops); i++ {
+			if i > 0 {
+				route += " -> "
+			}
+			route += fmt.Sprintf("%s[%d]", tokens[i].Hex()[:8], dexes[i])
+		}
+		route += " -> " + tokens[cand.Hops].Hex()[:8]
+		return route
+	}
 
 	// buildPayload creates a payload and does NOT reserve nonces or sign.
 	buildPayload := func(poolAddr common.Address, loanToken common.Address) *types.ExecutionPayload {
@@ -115,10 +131,10 @@ func SeedNextSubBlockBranches(
 		loanAmount := cand.AmountIn
 		minProfitWei := cand.NetProfitWei
 		if minProfitWei == nil || minProfitWei.Sign() <= 0 {
-			tokenPrice := solver.GetTokenPrice(loanToken, matrix, nil)
-			if tokenPrice <= 0 {
-				tokenPrice = 1.0
-			}
+			tokenPrice, ok := solver.GetTokenPrice(loanToken, matrix, nil)
+if !ok || tokenPrice <= 0 {
+    tokenPrice = 1.0
+}
 			decimals := getTokenDecimals(loanToken)
 			profitWei := new(big.Float).Mul(
 				big.NewFloat(cand.ExpectedProfitUSD/tokenPrice),
@@ -167,23 +183,6 @@ func SeedNextSubBlockBranches(
 		// Leave SignedRawTx and TxHash as zero – worker3 will sign.
 
 		return payload
-	}
-
-	formatRoute := func(cand *types.RouteCandidate) string {
-		if cand == nil || cand.Hops == 0 {
-			return "unknown"
-		}
-		tokens := cand.Tokens[:int(cand.Hops)+1]
-		dexes := cand.DexTypes[:int(cand.Hops)]
-		route := ""
-		for i := 0; i < int(cand.Hops); i++ {
-			if i > 0 {
-				route += " -> "
-			}
-			route += fmt.Sprintf("%s[%d]", tokens[i].Hex()[:8], dexes[i])
-		}
-		route += " -> " + tokens[cand.Hops].Hex()[:8]
-		return route
 	}
 
 	// ---- Build updates outside lock ----
