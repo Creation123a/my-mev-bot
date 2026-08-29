@@ -147,7 +147,7 @@ type PoolState struct {
 	Slot0Packed *big.Int 
 TickBitmap   map[int32]*big.Int
 LiquidityNet map[int32]*big.Int
-tickMu       sync.RWMutex     
+TickMu       sync.RWMutex     
 TickSpacing int32
 }
 
