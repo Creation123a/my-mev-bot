@@ -694,7 +694,7 @@ func tryMultipliers(
 	return bestCand
 }
 
-func buildRoundTrip2Hop(start, middle common.Address, matrix *state.Matrix, cfg *config.Config, cache *sync.Map) *types.RouteCandidate {
+func BuildRoundTrip2Hop(start, middle common.Address, matrix *state.Matrix, cfg *config.Config, cache *sync.Map) *types.RouteCandidate {
 	if start == middle {
 		return nil
 	}
@@ -741,7 +741,7 @@ func buildRoundTrip2Hop(start, middle common.Address, matrix *state.Matrix, cfg 
 	return bestCand
 }
 
-func buildRoundTrip3Hop(start, mid1, mid2 common.Address, matrix *state.Matrix, cfg *config.Config, cache *sync.Map) *types.RouteCandidate {
+func BuildRoundTrip3Hop(start, mid1, mid2 common.Address, matrix *state.Matrix, cfg *config.Config, cache *sync.Map) *types.RouteCandidate {
 	if start == mid1 || start == mid2 || mid1 == mid2 {
 		return nil
 	}
