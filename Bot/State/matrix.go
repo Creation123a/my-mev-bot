@@ -4,10 +4,11 @@ package state
 import (
 	"bytes"
 	"context"
-	"fmt"
+	"math"
 	"math/big"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/ethereum/go-ethereum"
@@ -37,6 +38,8 @@ type PoolStats struct {
 	LastLiquidityUSD  float64
 	LastUpdated       time.Time
 	SwapTimestamps    []time.Time
+	PriceVolatility   float64 
+	LastPrice         float64
 }
 
 func newPoolStats() *PoolStats {
@@ -71,6 +74,34 @@ func (ps *PoolStats) UpdateSwapWindow(now time.Time) {
 	}
 }
 
+// UpdateVolatility calculates EMA of absolute log returns (price volatility).
+func (ps *PoolStats) UpdateVolatility(pool *types.PoolState) {
+	ps.mu.Lock()
+	defer ps.mu.Unlock()
+
+	var price float64
+	if pool.DexType == types.DexUniswapV3 || pool.DexType == types.DexPancakeV3 {
+		if pool.SqrtPriceX96Float > 0 {
+			price = pool.SqrtPriceX96Float / 1e18
+		}
+	} else {
+		if pool.Reserve1Float > 0 {
+			price = pool.Reserve0Float / pool.Reserve1Float
+		}
+	}
+	if ps.LastPrice == 0 {
+		ps.LastPrice = price
+		return
+	}
+	ret := math.Log(price / ps.LastPrice)
+	ps.LastPrice = price
+	alpha := 0.1
+	ps.PriceVolatility = (1-alpha)*ps.PriceVolatility + alpha*math.Abs(ret)
+	if ps.PriceVolatility > 1 {
+		ps.PriceVolatility = 1
+	}
+}
+
 type Matrix struct {
 	mu               sync.RWMutex
 	pools            map[common.Address]*types.PoolState
@@ -86,6 +117,26 @@ type Matrix struct {
 
 	// Only factory ABI kept for CallFactory – used by gatekeeper.
 	factoryABI abi.ABI
+	lastBlock uint64 
+	lastHash  common.Hash 
+}
+// RangePools iterates over all pools under a read lock.
+// The callback returns false to stop iteration early.
+func (m *Matrix) RangePools(fn func(addr common.Address, pool *types.PoolState) bool) {
+    m.mu.RLock()
+    defer m.mu.RUnlock()
+    for addr, pool := range m.pools {
+        if !fn(addr, pool) {
+            break
+        }
+    }
+}
+
+// PoolCount returns the number of pools currently tracked.
+func (m *Matrix) PoolCount() int {
+    m.mu.RLock()
+    defer m.mu.RUnlock()
+    return len(m.pools)
 }
 
 func NewMatrix() *Matrix {
@@ -119,20 +170,55 @@ func (m *Matrix) CallFactory(ctx context.Context, pool common.Address) (common.A
 	return result, nil
 }
 
-func (m *Matrix) RegisterPath(path *types.Path) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	for _, pool := range path.Pools {
-		m.normalizePoolState(pool)
-		if _, exists := m.pools[pool.PoolAddress]; !exists {
-			m.pools[pool.PoolAddress] = pool
-			m.addToTokenPairIndexLocked(pool)
-			m.poolStats[pool.PoolAddress] = newPoolStats()
-		}
-	}
-	for _, pool := range path.Pools {
-		m.affectedPaths[pool.PoolAddress] = append(m.affectedPaths[pool.PoolAddress], path)
-	}
+// UpdateLastBlock stores the latest block number seen.
+func (m *Matrix) UpdateLastBlock(block uint64, hash common.Hash) {
+    atomic.StoreUint64(&m.lastBlock, block)
+    m.mu.Lock()
+    m.lastHash = hash
+    m.mu.Unlock()
+}
+
+func (m *Matrix) IsReorg(block uint64, hash common.Hash) bool {
+    lastBlock := atomic.LoadUint64(&m.lastBlock)
+    if lastBlock == 0 {
+        return false
+    }
+    m.mu.RLock()
+    lastHash := m.lastHash
+    m.mu.RUnlock()
+    // A re‑org is detected if block number is less than last, OR
+    // if block number is equal but the hash differs.
+    if block < lastBlock {
+        return true
+    }
+    if block == lastBlock && hash != lastHash {
+        return true
+    }
+    return false
+}
+
+// Clear resets the entire matrix state. Must be called when a re‑org is detected.
+// It holds the write lock for the entire operation.
+func (m *Matrix) Clear() {
+    m.mu.Lock()
+    defer m.mu.Unlock()
+    // Reset all maps to fresh state.
+    m.pools = make(map[common.Address]*types.PoolState, MaxPools)
+    m.affectedPaths = make(map[common.Address][]*types.Path, MaxPools)
+    m.tokenPairToPools = make(map[[2]common.Address][]*types.PoolState, MaxPools)
+    m.poolStats = make(map[common.Address]*PoolStats, MaxPools)
+    m.tokenToSlot = make(map[common.Address]uint8, MaxTokens)
+    // Clear slotToToken and matrix arrays.
+    for i := range m.slotToToken {
+        m.slotToToken[i] = common.Address{}
+    }
+    for i := range m.matrix {
+        for j := range m.matrix[i] {
+            m.matrix[i][j] = 0
+        }
+    }
+    // Reset lastBlock to 0 so the next log will be considered the new tip.
+    atomic.StoreUint64(&m.lastBlock, 0)
 }
 
 func (m *Matrix) RegisterPool(pool *types.PoolState) {
@@ -242,6 +328,7 @@ func (m *Matrix) UpdateFromLog(log *types.SwapLog) []*types.Path {
 
 	if stats != nil {
 		stats.UpdateSwapWindow(time.Now())
+		stats.UpdateVolatility(pool)
 		var liquidityUSD float64
 		pool.RLock()
 		if pool.DexType == types.DexUniswapV3 || pool.DexType == types.DexPancakeV3 {
@@ -305,7 +392,7 @@ func (m *Matrix) updateV2Pool(pool *types.PoolState, log *types.SwapLog, oldR0, 
 		expectedOutA := computeExpectedOut(oldR0, oldR1, amountIn)
 		expectedOutB := computeExpectedOut(oldR1, oldR0, amountIn)
 
-		tolerance := new(big.Int).Div(amountOut, big.NewInt(1000))
+		tolerance := new(big.Int).Div(amountOut, big.NewInt(10000))
 		if tolerance.Sign() == 0 {
 			tolerance = big.NewInt(1)
 		}
@@ -386,6 +473,7 @@ func (m *Matrix) updateV3Pool(pool *types.PoolState, log *types.SwapLog, oldSqrt
 	if log.Tick != 0 || log.SqrtPriceX96 != nil {
 		pool.Tick = log.Tick
 	}
+pool.Slot0Packed = types.PackV3Slot0(pool.SqrtPriceX96, pool.Tick)
 
 	const Q96 = 79228162514264337593543950336.0
 	if pool.SqrtPriceX96Float > 0 && pool.LiquidityFloat > 0 {
@@ -512,6 +600,17 @@ func (m *Matrix) GetPools() map[common.Address]*types.PoolState {
 	}
 	return cpy
 }
+// GetAllTokens returns a slice of all token addresses currently registered in the matrix.
+// This is used by the speculative seeder to iterate over known tokens.
+func (m *Matrix) GetAllTokens() []common.Address {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	tokens := make([]common.Address, 0, len(m.tokenToSlot))
+	for t := range m.tokenToSlot {
+		tokens = append(tokens, t)
+	}
+	return tokens
+}
 
 func (m *Matrix) RegisterToken(token common.Address, slot uint8) {
 	m.mu.Lock()
@@ -548,4 +647,38 @@ func (m *Matrix) GetMatrixValue(row, col uint8) uint64 {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	return m.matrix[row][col]
+}
+// SetPoolTickData updates the tick data for a V3 pool.
+func (m *Matrix) SetPoolTickData(poolAddr common.Address, bitmap map[int32]*big.Int, liquidityNet map[int32]*big.Int, tickSpacing int32) {
+    m.mu.RLock()
+    pool := m.pools[poolAddr]
+    m.mu.RUnlock()
+    if pool == nil {
+        return
+    }
+
+    // Convert bitmap map to byte slice
+    var bitmapBytes []byte
+    if len(bitmap) > 0 {
+        // Find maximum word index
+        maxWord := int32(0)
+        for w := range bitmap {
+            if w > maxWord {
+                maxWord = w
+            }
+        }
+        // Allocate slice of (maxWord+1)*32 bytes
+        bitmapBytes = make([]byte, (int(maxWord)+1)*32)
+        for w, word := range bitmap {
+            if word == nil || word.Sign() == 0 {
+                continue
+            }
+            wordBytes := word.Bytes()
+            // word is 256-bit, pad to 32 bytes on the left (big-endian)
+            offset := int(w) * 32
+            copy(bitmapBytes[offset+32-len(wordBytes):offset+32], wordBytes)
+        }
+    }
+
+    pool.SetTickData(bitmapBytes, liquidityNet, tickSpacing)
 }
