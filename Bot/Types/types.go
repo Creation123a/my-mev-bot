@@ -183,7 +183,9 @@ func (p *PoolState) Reset() {
     p.Slot0Packed = new(big.Int)
 } else {
     p.Slot0Packed.SetInt64(0)
-}p.TickBitmap = nil
+
+	}
+	p.TickBitmap = nil
 p.LiquidityNet = nil
 p.TickSpacing = 0
 	p.Tick = 0
