@@ -367,7 +367,7 @@ func (gk *Gatekeeper) fetchV3TickDataSync(ctx context.Context, pool common.Addre
     for w, word := range bitmap {
         for bit := 0; bit < 256; bit++ {
             if word.Bit(bit) == 1 {
-                tick := int32(w*256 + bit)
+                tick := w*256 + int32(bit)
                 setTicks = append(setTicks, tick)
             }
         }
