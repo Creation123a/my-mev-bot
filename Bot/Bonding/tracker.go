@@ -958,8 +958,7 @@ var err error
 	cand.GasEstimate = gasEstimate
 	t.mu.Unlock()
 
-	// Send payload with explicit parameters
-poolAddr := cand.PoolAddress
+	// Send payload with explicit parameters (poolAddr already defined)
 t.sendPayload(
     factory, 
     tokenAddr, 
