@@ -656,29 +656,5 @@ func (m *Matrix) SetPoolTickData(poolAddr common.Address, bitmap map[int32]*big.
     if pool == nil {
         return
     }
-
-    // Convert bitmap map to byte slice
-    var bitmapBytes []byte
-    if len(bitmap) > 0 {
-        // Find maximum word index
-        maxWord := int32(0)
-        for w := range bitmap {
-            if w > maxWord {
-                maxWord = w
-            }
-        }
-        // Allocate slice of (maxWord+1)*32 bytes
-        bitmapBytes = make([]byte, (int(maxWord)+1)*32)
-        for w, word := range bitmap {
-            if word == nil || word.Sign() == 0 {
-                continue
-            }
-            wordBytes := word.Bytes()
-            // word is 256-bit, pad to 32 bytes on the left (big-endian)
-            offset := int(w) * 32
-            copy(bitmapBytes[offset+32-len(wordBytes):offset+32], wordBytes)
-        }
-    }
-
-    pool.SetTickData(bitmapBytes, liquidityNet, tickSpacing)
+    pool.SetTickData(bitmap, liquidityNet, tickSpacing)
 }
