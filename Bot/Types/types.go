@@ -66,6 +66,7 @@ type SwapLog struct {
 	Tick             int32
 	SqrtPriceX96Float float64
 	LiquidityFloat    float64
+	RawJSON []byte
 }
 
 // Reset reuses the SwapLog without new allocations.
@@ -137,11 +138,17 @@ type PoolState struct {
 	LiquidityFloat    float64
 
 	LastUpdated time.Time
-
+	
+     Stable bool
 	// mu protects all mutable fields (Reserve0Float, Reserve1Float, SqrtPriceX96Float,
 	// LiquidityFloat, Tick, LastUpdated, and the big.Int fields when they are mutated).
 	// Read locks are used in solver paths, write locks in UpdateFromLog.
 	mu sync.RWMutex
+	Slot0Packed *big.Int 
+TickBitmap   map[int32]*big.Int
+LiquidityNet map[int32]*big.Int
+tickMu       sync.RWMutex     
+TickSpacing int32
 }
 
 // Reset reuses the PoolState without allocating new big.Ints.
@@ -151,6 +158,7 @@ func (p *PoolState) Reset() {
 	p.Token1 = common.Address{}
 	p.DexType = 0
 	p.FeeBps = 0
+	p.Stable = false
 	if p.Reserve0 == nil {
 		p.Reserve0 = new(big.Int)
 	} else {
@@ -171,12 +179,27 @@ func (p *PoolState) Reset() {
 	} else {
 		p.Liquidity.SetInt64(0)
 	}
+	if p.Slot0Packed == nil {
+    p.Slot0Packed = new(big.Int)
+} else {
+    p.Slot0Packed.SetInt64(0)
+}p.TickBitmap = nil
+p.LiquidityNet = nil
+p.TickSpacing = 0
 	p.Tick = 0
 	p.Reserve0Float = 0
 	p.Reserve1Float = 0
 	p.SqrtPriceX96Float = 0
 	p.LiquidityFloat = 0
 	p.LastUpdated = time.Time{}
+}
+// SetTickData stores the tick bitmap, liquidity net, and tick spacing atomically.
+func (p *PoolState) SetTickData(bitmap map[int32]*big.Int, liquidityNet map[int32]*big.Int, tickSpacing int32) {
+    p.tickMu.Lock()
+    defer p.tickMu.Unlock()
+    p.TickBitmap = bitmap
+    p.LiquidityNet = liquidityNet
+    p.TickSpacing = tickSpacing
 }
 
 // IsZero returns true if the pool address is empty.
@@ -189,6 +212,25 @@ func (p *PoolState) CopySqrtAndLiquidity(sqrtDest, liqDest *big.Int) {
     defer p.mu.RUnlock()
     sqrtDest.Set(p.SqrtPriceX96)
     liqDest.Set(p.Liquidity)
+}
+// GetTickBitmapWord returns the 256‑bit word at the given word index.
+func (p *PoolState) GetTickBitmapWord(wordIndex int32) *big.Int {
+    p.tickMu.RLock()
+    defer p.tickMu.RUnlock()
+    if p.TickBitmap == nil {
+        return nil
+    }
+    return p.TickBitmap[wordIndex]
+}
+
+// GetLiquidityNet returns the net liquidity change at a tick.
+func (p *PoolState) GetLiquidityNet(tick int32) *big.Int {
+    p.tickMu.RLock()
+    defer p.tickMu.RUnlock()
+    if p.LiquidityNet == nil {
+        return nil
+    }
+    return p.LiquidityNet[tick]
 }
 // =============================================================================
 // PoolState exported accessors (for lock-safe reading)
@@ -238,6 +280,7 @@ func (p *PoolState) RUnlock() {
     p.mu.RUnlock()
 }
 
+// RouteCandidate represents a potential arbitrage route with optimal input amount.
 type RouteCandidate struct {
 	Hops uint8 // 2 or 3
 
@@ -251,6 +294,7 @@ type RouteCandidate struct {
 	DexTypes     [MaxHops]DexType
 	ZeroForOnes  [MaxHops]bool
 	MinOuts      [MaxHops]*big.Int
+	FeeBps       [MaxHops]uint32 // fee in basis points per hop (used for calldata)
 
 	// Input amount (in first token, which is the loan token)
 	AmountIn        *big.Int
@@ -267,7 +311,7 @@ type RouteCandidate struct {
 	Competition float64
 }
 
-// Reset reuses the RouteCandidate.
+// Reset reuses the RouteCandidate without freeing big.Ints.
 func (r *RouteCandidate) Reset() {
 	r.Hops = 0
 	for i := 0; i < MaxHops+1; i++ {
@@ -282,6 +326,7 @@ func (r *RouteCandidate) Reset() {
 		} else {
 			r.MinOuts[i].SetInt64(0)
 		}
+		r.FeeBps[i] = 0
 	}
 	if r.AmountIn == nil {
 		r.AmountIn = new(big.Int)
@@ -325,6 +370,9 @@ type ExecutionPayload struct {
 	RouteDesc      string    // human-readable route for logging
 	RoutePools     []common.Address // pool addresses in the route (for reroute filtering)
 	OriginalCandidate *RouteCandidate
+	SignedRawTx []byte        `json:"-"`
+    TxHash      common.Hash   `json:"-"`
+    GasFeeCap    uint64
 }
 
 // Reset reuses the ExecutionPayload without reallocating byte slice.
@@ -355,9 +403,28 @@ func (e *ExecutionPayload) Reset() {
 	e.RouteDesc = ""
 	e.RoutePools = e.RoutePools[:0]
 	e.OriginalCandidate = nil
+	e.SignedRawTx = e.SignedRawTx[:0]
+    e.TxHash = common.Hash{}
 }
 
 // IsZero returns true if the TargetExecutor is empty.
 func (e *ExecutionPayload) IsZero() bool {
 	return e.TargetExecutor == common.Address{}
+}
+func PackV3Slot0(sqrtPriceX96 *big.Int, tick int32) *big.Int {
+    packed := new(big.Int).Set(sqrtPriceX96)
+    tickVal := uint64(int64(tick)) & 0xFFFFFF
+    tickBig := new(big.Int).SetUint64(tickVal)
+    tickBig.Lsh(tickBig, 160)
+    packed.Or(packed, tickBig)
+    // Set cardinality, unlocked flag (same as in injectPoolState)
+    cardBig := new(big.Int).SetUint64(1)
+    cardBig.Lsh(cardBig, 200)
+    packed.Or(packed, cardBig)
+    cardNextBig := new(big.Int).SetUint64(1)
+    cardNextBig.Lsh(cardNextBig, 216)
+    packed.Or(packed, cardNextBig)
+    unlockedBit := new(big.Int).Lsh(big.NewInt(1), 240)
+    packed.Or(packed, unlockedBit)
+    return packed
 }
