@@ -310,6 +310,7 @@ default:
     PutSwapLog(swapLog)
 }
 }
+}
 // newLowLatencyDialer creates a WebSocket dialer with TCP_NODELAY and other low‑latency settings.
 func newLowLatencyDialer() websocket.Dialer {
 	netDialer := &net.Dialer{
