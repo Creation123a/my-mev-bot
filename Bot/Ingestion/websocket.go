@@ -15,7 +15,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/andybalholm/brotli"
+	"github.com/buger/jsonparser"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/gorilla/websocket"
 
@@ -23,14 +23,13 @@ import (
 )
 
 const (
-	socketReadBufferSize    = 65536
-	socketWriteBufferSize   = 65536
-	pingInterval            = 30 * time.Second
-	pongWait                = 120 * time.Second
-	minBackoff              = 250 * time.Millisecond
-	maxBackoff              = 30 * time.Second
-	minStableConnection     = 30 * time.Second
-	decompressionBufferSize = 131072
+	socketReadBufferSize  = 65536
+	socketWriteBufferSize = 65536
+	pingInterval          = 30 * time.Second
+	pongWait              = 120 * time.Second
+	minBackoff            = 250 * time.Millisecond
+	maxBackoff            = 30 * time.Second
+	minStableConnection   = 30 * time.Second
 )
 
 // SwapLogPool reuses SwapLog objects to reduce GC pressure.
@@ -58,8 +57,8 @@ func redactURL(raw string) string {
 	return u.Scheme + "://" + u.Host + "/<redacted>"
 }
 
-// StartWebSocketReader connects to Base, subscribes to Swap events for the given pool addresses,
-// decompresses Brotli payloads, and forwards parsed SwapLogs to the event channel.
+// StartWebSocketReader connects to Base, subscribes to Swap events, and forwards parsed SwapLogs.
+// No compression is used; all messages are expected as plain JSON over TextMessage.
 func StartWebSocketReader(
 	ctx context.Context,
 	wsURL string,
@@ -135,21 +134,16 @@ func StartWebSocketReader(
 
 		var writeMu sync.Mutex
 
-		// Handle Pong frames from server to extend deadline.
 		conn.SetPongHandler(func(string) error {
 			return conn.SetReadDeadline(time.Now().Add(pongWait))
 		})
 
-		// CRITICAL FIX: Handle server-initiated Ping frames by replying with Pong.
-		// This ensures the connection stays alive even if the server doesn't respond to our pings.
 		conn.SetPingHandler(func(appData string) error {
 			writeMu.Lock()
 			defer writeMu.Unlock()
-			// Send Pong back immediately.
 			if err := conn.WriteControl(websocket.PongMessage, []byte(appData), time.Now().Add(5*time.Second)); err != nil {
 				return err
 			}
-			// Extend read deadline because we received activity.
 			return conn.SetReadDeadline(time.Now().Add(pongWait))
 		})
 
@@ -216,8 +210,8 @@ func StartWebSocketReader(
 	}
 }
 
-// readLoop reads messages, handles Brotli decompression using the WebSocket message type,
-// and parses the JSON‑RPC payload.
+// readLoop reads messages from the WebSocket, extracts log data using jsonparser,
+// and sends parsed SwapLogs to the event channel.
 func readLoop(
 	ctx context.Context,
 	conn *websocket.Conn,
@@ -225,11 +219,8 @@ func readLoop(
 	decoder *Decoder,
 	writeMu *sync.Mutex,
 ) error {
-	br := brotli.NewReader(nil)
-
-	// Buffers allocated once per loop to avoid stack churn and improve CPU cache usage.
-	var readBuffer [decompressionBufferSize]byte
-	var decompressionBuffer [decompressionBufferSize]byte
+	// Buffers allocated once per loop to avoid allocations.
+	var readBuffer [65536]byte
 
 	for {
 		select {
@@ -238,7 +229,6 @@ func readLoop(
 		default:
 		}
 
-		// Refresh read deadline BEFORE each read attempt to prevent timeouts.
 		if err := conn.SetReadDeadline(time.Now().Add(pongWait)); err != nil {
 			return fmt.Errorf("set read deadline: %w", err)
 		}
@@ -248,15 +238,17 @@ func readLoop(
 			return fmt.Errorf("next reader: %w", err)
 		}
 
-		if msgType != websocket.TextMessage && msgType != websocket.BinaryMessage {
-			_, _ = reader.Read(readBuffer[:])
+		// We only accept TextMessage (plain JSON). Skip binary messages.
+		if msgType != websocket.TextMessage {
+			// Drain and discard the message.
+			_, _ = io.Copy(io.Discard, reader)
 			continue
 		}
 
+		// Read the payload into the pre‑allocated buffer.
 		totalRead := 0
-		truncated := false
 		for {
-			n, err := reader.Read(readBuffer[totalRead:decompressionBufferSize])
+			n, err := reader.Read(readBuffer[totalRead:])
 			totalRead += n
 			if err == io.EOF {
 				break
@@ -264,104 +256,60 @@ func readLoop(
 			if err != nil {
 				return err
 			}
-			if totalRead >= decompressionBufferSize {
-				log.Printf("[WebSocket] Payload exceeds %d bytes; dropping message", decompressionBufferSize)
-				truncated = true
-				for {
-					var dummy [4096]byte
-					_, err := reader.Read(dummy[:])
-					if err == io.EOF {
-						break
-					}
-					if err != nil {
-						return err
-					}
-				}
+			if totalRead >= len(readBuffer) {
+				// Payload too large; discard the rest.
+				log.Printf("[WebSocket] Payload exceeds buffer size; dropping message")
+				_, _ = io.Copy(io.Discard, reader)
+				totalRead = 0 // reset to avoid processing truncated data
 				break
 			}
 		}
-		if truncated {
+		if totalRead == 0 {
 			continue
 		}
-		payload := readBuffer[:totalRead]
+		raw := readBuffer[:totalRead]
 
-		var rawMessage []byte
-		// Use the WebSocket message type to determine if decompression is needed – reliable.
-		if msgType == websocket.TextMessage {
-			rawMessage = payload
-		} else {
-			br.Reset(bytes.NewReader(payload))
-			totalDecomp := 0
-			decompFailed := false
-			for {
-				if totalDecomp >= decompressionBufferSize {
-					log.Printf("[WebSocket] Decompressed data exceeds buffer size; truncating")
-					decompFailed = true
-					break
-				}
-				chunk := decompressionBuffer[totalDecomp:decompressionBufferSize]
-				n, err := br.Read(chunk)
-				totalDecomp += n
-				if err == io.EOF {
-					break
-				}
-				if err != nil {
-					log.Printf("[WebSocket] Brotli decompression failed: %v", err)
-					decompFailed = true
-					break
-				}
-				if n == 0 {
-					log.Printf("[WebSocket] Brotli decompression stalled (n=0, err=nil)")
-					decompFailed = true
-					break
-				}
-			}
-			if decompFailed {
+		// Check if it's a subscription event (contains "method" and "subscription").
+		// We use bytes.Contains for a quick check before expensive jsonparser calls.
+		if !bytes.Contains(raw, []byte(`"method"`)) && !bytes.Contains(raw, []byte(`"subscription"`)) {
+			// Could be a subscription response or other message; ignore.
+			continue
+		}
+
+		// Extract the "params.result" object, which contains the log data.
+		logData, dataType, _, err := jsonparser.Get(raw, "params", "result")
+		if err != nil {
+			// If not found, try "result" (for single responses)
+			logData, dataType, _, err = jsonparser.Get(raw, "result")
+			if err != nil || dataType != jsonparser.Object {
 				continue
 			}
-			rawMessage = decompressionBuffer[:totalDecomp]
 		}
-
-		// Flexible JSON‑RPC parsing – handles both subscription and single‑response formats.
-		var rpcMsg struct {
-			Method string `json:"method"`
-			Params struct {
-				Result json.RawMessage `json:"result"`
-			} `json:"params"`
-			Result json.RawMessage `json:"result"`
-		}
-		if err := json.Unmarshal(rawMessage, &rpcMsg); err != nil {
-			log.Printf("[WebSocket] JSON-RPC parse error: %v", err)
+		if dataType != jsonparser.Object || len(logData) < 10 {
 			continue
 		}
 
-		var logData []byte
-		if strings.HasSuffix(rpcMsg.Method, "subscription") {
-			logData = rpcMsg.Params.Result
-		} else if len(rpcMsg.Result) > 0 {
-			logData = rpcMsg.Result
-		} else {
-			continue
-		}
+// Reuse a SwapLog from the pool.
+swapLog := GetSwapLog()
 
-		if len(logData) == 0 {
-			continue
-		}
+// Store a copy of the raw JSON for short‑circuit matching.
+// The append reuses the slice's capacity (zero‑allocation after first use).
+swapLog.RawJSON = append(swapLog.RawJSON[:0], logData...)
 
-		swapLog := GetSwapLog()
-		if err := decoder.ParseSwapLog(logData, swapLog); err != nil {
-			PutSwapLog(swapLog)
-			continue
-		}
-
-		select {
-		case eventChan <- swapLog:
-		default:
-			PutSwapLog(swapLog)
-		}
-	}
+// Parse the log (pass the decoder).
+if err := parseSwapLogZeroAlloc(logData, swapLog, decoder); err != nil {
+    // If parsing fails, return the log to the pool and continue.
+    PutSwapLog(swapLog)
+    continue
 }
 
+// Forward to event channel (non‑blocking to avoid head‑of‑line blocking).
+select {
+case eventChan <- swapLog:
+default:
+    PutSwapLog(swapLog)
+}
+}
 // newLowLatencyDialer creates a WebSocket dialer with TCP_NODELAY and other low‑latency settings.
 func newLowLatencyDialer() websocket.Dialer {
 	netDialer := &net.Dialer{
@@ -385,7 +333,7 @@ func newLowLatencyDialer() websocket.Dialer {
 		NetDial:           netDialer.Dial,
 		ReadBufferSize:    socketReadBufferSize,
 		WriteBufferSize:   socketWriteBufferSize,
-		EnableCompression: false,
+		EnableCompression: false, // we don't use compression
 	}
 }
 
