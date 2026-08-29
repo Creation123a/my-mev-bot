@@ -28,28 +28,52 @@ const (
 	SlippageBuffer      = 0.99
 	HopPenalty3Hop      = 0.05
 	MinScore            = 0.01
-	MemeAdmissionProfit = 0.50 // USD gross – used by gatekeeper for meme qualification
+	MemeAdmissionProfit = 0.50
 )
+
+type PriceEntry struct {
+    Price     float64
+    Timestamp int64
+}
+
+var decimalsCache = struct {
+	sync.RWMutex
+	m map[common.Address]uint8
+}{m: make(map[common.Address]uint8)}
 
 var v3CalcPool = sync.Pool{
 	New: func() interface{} { return NewV3Calculator() },
 }
-
 var floatPool = sync.Pool{
 	New: func() interface{} { return new(big.Float) },
 }
 
 var (
-	currentGasCostUSDPerGas atomic.Value // float64
-	currentL1BaseFeeUSD     atomic.Value // float64
-	currentL1GasCostPerByte atomic.Value // float64 – L1 data gas cost per byte in USD
-	ethPriceUSD             atomic.Value // float64
+	currentL1BaseFeeUSD     atomic.Value
+	currentL2BaseFeeUSD     atomic.Value
+	currentL1GasCostPerByte atomic.Value
+	ethPriceUSD             atomic.Value
+)
+var (
+    priceLocksMu     sync.Mutex
+    priceComputeLocks = make(map[common.Address]*sync.Mutex)
 )
 
+// getPriceLock returns a per‑token mutex, creating one if needed.
+func getPriceLock(token common.Address) *sync.Mutex {
+    priceLocksMu.Lock()
+    defer priceLocksMu.Unlock()
+    mu, ok := priceComputeLocks[token]
+    if !ok {
+        mu = &sync.Mutex{}
+        priceComputeLocks[token] = mu
+    }
+    return mu
+}
 func init() {
-	currentGasCostUSDPerGas.Store(0.00000000005)
-	currentL1BaseFeeUSD.Store(0.00000000001)
-	currentL1GasCostPerByte.Store(0.000000000001) // placeholder
+	currentL1BaseFeeUSD.Store(0.0)
+	currentL2BaseFeeUSD.Store(0.0)
+	currentL1GasCostPerByte.Store(0.0)
 	ethPriceUSD.Store(3000.0)
 }
 
@@ -66,7 +90,82 @@ func GetEthPrice() float64 {
 	return 3000.0
 }
 
-// StartL1FeeUpdater fetches L1 base fee, overhead, scalar and computes cost per byte.
+func GetCurrentL1BaseFeeUSD() float64 {
+	if v := currentL1BaseFeeUSD.Load(); v != nil {
+		return v.(float64)
+	}
+	return 0.0
+}
+
+func GetCurrentL2BaseFeeUSD() float64 {
+	if v := currentL2BaseFeeUSD.Load(); v != nil {
+		return v.(float64)
+	}
+	return 0.0
+}
+
+func GetCurrentL1GasCostPerByte() float64 {
+	if v := currentL1GasCostPerByte.Load(); v != nil {
+		return v.(float64)
+	}
+	return 0.0
+}
+
+func FetchCurrentFees(client *ethclient.Client) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	l1Contract := common.HexToAddress("0x4200000000000000000000000000000000000015")
+	l1Data := crypto.Keccak256([]byte("l1BaseFee()"))[:4]
+	blobData := crypto.Keccak256([]byte("blobBaseFee()"))[:4]
+	msgL1 := ethereum.CallMsg{To: &l1Contract, Data: l1Data}
+	msgBlob := ethereum.CallMsg{To: &l1Contract, Data: blobData}
+
+	l1Res, err1 := client.CallContract(ctx, msgL1, nil)
+	blobRes, err2 := client.CallContract(ctx, msgBlob, nil)
+	if err1 == nil && err2 == nil && len(l1Res) >= 32 && len(blobRes) >= 32 {
+		l1BaseFeeWei := new(big.Int).SetBytes(l1Res)
+		blobBaseFeeWei := new(big.Int).SetBytes(blobRes)
+		ethPrice := GetEthPrice()
+		l1TotalWei := new(big.Int).Mul(l1BaseFeeWei, big.NewInt(16))
+		l1TotalWei.Add(l1TotalWei, blobBaseFeeWei)
+		costPerByte := new(big.Float).Quo(
+			new(big.Float).Mul(new(big.Float).SetInt(l1TotalWei), big.NewFloat(ethPrice)),
+			big.NewFloat(1e18),
+		)
+		costPerByteFloat, _ := costPerByte.Float64()
+		if costPerByteFloat > 0 {
+			currentL1GasCostPerByte.Store(costPerByteFloat)
+		}
+		l1BaseFeeUSDVal := new(big.Float).Quo(
+			new(big.Float).Mul(new(big.Float).SetInt(l1BaseFeeWei), big.NewFloat(ethPrice)),
+			big.NewFloat(1e18),
+		)
+		l1BaseFeeUSD, _ := l1BaseFeeUSDVal.Float64()
+		if l1BaseFeeUSD > 0 {
+			currentL1BaseFeeUSD.Store(l1BaseFeeUSD)
+		}
+	}
+
+	header, err := client.HeaderByNumber(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("failed to get latest block header: %w", err)
+	}
+	l2BaseFeeWei := header.BaseFee
+	if l2BaseFeeWei != nil {
+		ethPrice := GetEthPrice()
+		l2BaseFeeUSDVal := new(big.Float).Quo(
+			new(big.Float).Mul(new(big.Float).SetInt(l2BaseFeeWei), big.NewFloat(ethPrice)),
+			big.NewFloat(1e18),
+		)
+		l2BaseFeeUSD, _ := l2BaseFeeUSDVal.Float64()
+		if l2BaseFeeUSD > 0 {
+			currentL2BaseFeeUSD.Store(l2BaseFeeUSD)
+		}
+	}
+	return nil
+}
+
 func StartL1FeeUpdater(client *ethclient.Client, ctx context.Context) {
 	go func() {
 		ticker := time.NewTicker(10 * time.Second)
@@ -76,87 +175,12 @@ func StartL1FeeUpdater(client *ethclient.Client, ctx context.Context) {
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				// L1 base fee (from 0x4200000000000000000000000000000000000015)
-				contract := common.HexToAddress("0x4200000000000000000000000000000000000015")
-				data := crypto.Keccak256([]byte("basefee()"))[:4]
-				msg := ethereum.CallMsg{To: &contract, Data: data}
-				ctx2, cancel := context.WithTimeout(ctx, 1*time.Second)
-				result, err := client.CallContract(ctx2, msg, nil)
-				cancel()
-				if err == nil {
-					l1BaseFee := new(big.Int).SetBytes(result)
-					l1BaseFeeWei, _ := new(big.Float).SetInt(l1BaseFee).Float64()
-					ethPrice := GetEthPrice()
-					l1BaseFeeUSDPerGas := l1BaseFeeWei * ethPrice / 1e18
-					if l1BaseFeeUSDPerGas > 0 {
-						currentL1BaseFeeUSD.Store(l1BaseFeeUSDPerGas)
-					}
-				}
-
-				// GasPriceOracle (0x420000000000000000000000000000000000000F) for overhead and scalar
-				oracle := common.HexToAddress("0x420000000000000000000000000000000000000F")
-				overheadData := crypto.Keccak256([]byte("overhead()"))[:4]
-				scalarData := crypto.Keccak256([]byte("scalar()"))[:4]
-				msgOverhead := ethereum.CallMsg{To: &oracle, Data: overheadData}
-				msgScalar := ethereum.CallMsg{To: &oracle, Data: scalarData}
-				ctx3, cancel3 := context.WithTimeout(ctx, 1*time.Second)
-				overheadRes, err1 := client.CallContract(ctx3, msgOverhead, nil)
-				if err1 == nil {
-					overhead := new(big.Int).SetBytes(overheadRes)
-					scalarRes, err2 := client.CallContract(ctx3, msgScalar, nil)
-					if err2 == nil {
-						scalar := new(big.Int).SetBytes(scalarRes)
-						// L1 data gas cost per byte = (l1BaseFee * scalar * overhead) / 1e9
-						// Convert to USD: l1BaseFeeUSDPerGas * scalar * overhead / 1e9
-						l1BaseFeeUSDPerGas := currentL1BaseFeeUSD.Load().(float64)
-						overheadF, _ := new(big.Float).SetInt(overhead).Float64()
-						scalarF, _ := new(big.Float).SetInt(scalar).Float64()
-						if overheadF > 0 && scalarF > 0 {
-							costPerByte := l1BaseFeeUSDPerGas * scalarF * overheadF / 1e9
-							if costPerByte > 0 {
-								currentL1GasCostPerByte.Store(costPerByte)
-							}
-						}
-					}
-				}
-				cancel3()
-
-				// L2 execution gas cost (approximate)
-				ethPrice := GetEthPrice()
-				l2GasCostUSD := 0.5 * ethPrice / 1e9
-				l1BaseFeeUSDPerGas := currentL1BaseFeeUSD.Load().(float64)
-				totalGasCostUSD := l1BaseFeeUSDPerGas + l2GasCostUSD
-				if totalGasCostUSD > 0 {
-					currentGasCostUSDPerGas.Store(totalGasCostUSD)
-				}
+				_ = FetchCurrentFees(client)
 			}
 		}
 	}()
 }
 
-func GetCurrentL1BaseFeeUSD() float64 {
-	if v := currentL1BaseFeeUSD.Load(); v != nil {
-		return v.(float64)
-	}
-	return 0.00000000001
-}
-
-// GetCurrentL1GasCostPerByte returns the current L1 data gas cost per byte in USD.
-func GetCurrentL1GasCostPerByte() float64 {
-	if v := currentL1GasCostPerByte.Load(); v != nil {
-		return v.(float64)
-	}
-	return 0.000000000001
-}
-
-func GetCurrentGasCostUSD() float64 {
-	if v := currentGasCostUSDPerGas.Load(); v != nil {
-		return v.(float64)
-	}
-	return 0.00000000005
-}
-
-// estimateGasForCandidate returns a rough estimate of gas used for a candidate.
 func estimateGasForCandidate(cand *types.RouteCandidate) uint64 {
 	base := uint64(150000)
 	if cand.Hops == 2 {
@@ -167,12 +191,10 @@ func estimateGasForCandidate(cand *types.RouteCandidate) uint64 {
 	return uint64(float64(base) * 1.2)
 }
 
-// isStableV2Pool returns true if the pool is a stable Aerodrome V2 pool (unsupported).
 func isStableV2Pool(pool *types.PoolState) bool {
 	return pool.DexType == types.DexAerodromeV2 && pool.Stable
 }
 
-// getBestPool returns the pool with the highest liquidity, skipping stable pools.
 func getBestPool(pools []*types.PoolState) *types.PoolState {
 	if len(pools) == 0 {
 		return nil
@@ -192,7 +214,6 @@ func getBestPool(pools []*types.PoolState) *types.PoolState {
 	return best
 }
 
-// getTopTwoPools returns the two pools with the highest liquidity, skipping stable pools.
 func getTopTwoPools(pools []*types.PoolState) (*types.PoolState, *types.PoolState) {
 	if len(pools) < 2 {
 		return nil, nil
@@ -224,7 +245,6 @@ func PrecomputePaths(matrix *state.Matrix, blacklist interface{}) *PathIndex {
 	}
 }
 
-// ---------- Worker Pool ----------
 var taskCh = make(chan func(), 100)
 
 func init() {
@@ -237,8 +257,7 @@ func init() {
 		}()
 	}
 }
-// EvaluateEvent generates and evaluates candidate routes with dynamic L1 fee threshold.
-// It uses the worker pool to evaluate routes in parallel.
+
 func EvaluateEvent(log *types.SwapLog, matrix *state.Matrix, cfg *config.Config) []*types.RouteCandidate {
 	if log == nil || matrix == nil {
 		return nil
@@ -246,24 +265,20 @@ func EvaluateEvent(log *types.SwapLog, matrix *state.Matrix, cfg *config.Config)
 	if log.TokenIn == (common.Address{}) || log.TokenOut == (common.Address{}) {
 		return nil
 	}
-
 	tokenA := log.TokenIn
 	tokenB := log.TokenOut
 	if tokenA == (common.Address{}) || tokenB == (common.Address{}) {
 		return nil
 	}
-
 	pools := matrix.GetPoolsForPair(tokenA, tokenB)
 	if len(pools) == 0 {
 		return nil
 	}
-
 	anchors := config.AnchorAssets()
 	anchorMap := make(map[common.Address]bool)
 	for _, a := range anchors {
 		anchorMap[a] = true
 	}
-
 	isAnchorA := anchorMap[tokenA]
 	isAnchorB := anchorMap[tokenB]
 
@@ -305,13 +320,10 @@ func EvaluateEvent(log *types.SwapLog, matrix *state.Matrix, cfg *config.Config)
 		candidates = append(candidates, cand)
 	}
 
-	// Dynamic L1 fee threshold – fetch once per evaluation
 	l1CostPerByte := GetCurrentL1GasCostPerByte()
 	baseCalldata := 2000
 
-	// Compute competition score, apply L1 threshold, and set final score
 	for _, cand := range candidates {
-		// 1. Competition score
 		routeComp := 0.0
 		for i := 0; i < int(cand.Hops); i++ {
 			poolAddr := cand.Pools[i]
@@ -322,30 +334,50 @@ func EvaluateEvent(log *types.SwapLog, matrix *state.Matrix, cfg *config.Config)
 		}
 		cand.Competition = routeComp
 
-		// 2. Hop penalty
-		hopPenalty := 0.0
-		if cand.Hops == 3 {
-			hopPenalty = HopPenalty3Hop
+		baseProfit := cand.ExpectedProfitUSD
+		if baseProfit <= 0 {
+			cand.Score = 0
+			continue
 		}
-
-		// 3. Base score (profit adjusted for competition and hops)
-		score := cand.ExpectedProfitUSD * (1 - routeComp) * (1 - hopPenalty)
-		if score < MinScore {
+		compPenalty := math.Exp(-0.7 * math.Max(0, routeComp))
+		volatility := 0.5
+		stats := matrix.GetPoolStats(cand.Pools[0])
+		if stats != nil {
+			volatility = stats.PriceVolatility
+		}
+		volatilityMultiplier := 1.0 + 0.4*(1.0/(1.0+math.Exp(-5.0*(volatility-0.5))))
+		historyMultiplier := 1.0
+		if stats != nil {
+			total := stats.Win + stats.Fail
+			if total >= 5 {
+				winRate := float64(stats.Win) / float64(total)
+				historyMultiplier = 0.85 + 0.30*winRate
+			}
+		}
+		crowdPenalty := 1.0
+		if stats != nil {
+			swaps := float64(stats.SwapsWindow1m)
+			crowdPenalty = 1.0 - 0.40/(1.0+math.Exp(-0.1*(swaps-50.0)))
+		}
+		hopPenalty := 1.0
+		if cand.Hops == 3 {
+			hopPenalty = 1.0 - HopPenalty3Hop
+		}
+		score := baseProfit * compPenalty * volatilityMultiplier * historyMultiplier * crowdPenalty * hopPenalty
+		if math.IsNaN(score) || math.IsInf(score, 0) || score < 0 {
 			score = 0
 		}
 		cand.Score = score
 		cand.ExecutionSlippage = 0.5
 
-		// 4. L1 fee threshold (if profit cannot cover gas + buffer, drop)
 		calldataBytes := baseCalldata + 500*int(cand.Hops)
 		l1Cost := l1CostPerByte * float64(calldataBytes)
-		minProfit := cfg.MinProfitUSD + l1Cost + 0.50 // $0.50 safety buffer
+		minProfit := cfg.MinProfitUSD + l1Cost + 0.50
 		if cand.ExpectedProfitUSD < minProfit {
-			cand.Score = 0 // drop this candidate
+			cand.Score = 0
 		}
 	}
 
-	// Sort by score (descending) and filter out dropped candidates
 	sort.Slice(candidates, func(i, j int) bool {
 		return candidates[i].Score > candidates[j].Score
 	})
@@ -358,24 +390,60 @@ func EvaluateEvent(log *types.SwapLog, matrix *state.Matrix, cfg *config.Config)
 	}
 	return filtered
 }
-// =============================================================================
-//  OPTIMAL INPUT SIZING – CLOSED‑FORM & NUMERICAL
-// =============================================================================
-// computeOptimalAmount2Hop returns the optimal input amount for a 2-hop round-trip on constant product pools.
-// Uses closed-form: x* = sqrt( (R0 * R1 * (1-f0)*(1-f1)) / (1 - (1-f0)*(1-f1)) ) - R0
+
+func computeOptimalInputRaw(pool *types.PoolState, tokenIn common.Address) *big.Int {
+	if pool == nil {
+		return big.NewInt(0)
+	}
+	r0, r1 := pool.GetReserves()
+	if r0 <= 0 || r1 <= 0 {
+		return big.NewInt(0)
+	}
+	var reserveInFloat, reserveOutFloat float64
+	if tokenIn == pool.Token0 {
+		reserveInFloat = r0
+		reserveOutFloat = r1
+	} else if tokenIn == pool.Token1 {
+		reserveInFloat = r1
+		reserveOutFloat = r0
+	} else {
+		return big.NewInt(0)
+	}
+	if reserveInFloat <= 0 || reserveOutFloat <= 0 {
+		return big.NewInt(0)
+	}
+	fee := getFeeFactor(pool)
+	if fee <= 0 || fee >= 1 {
+		return big.NewInt(0)
+	}
+	fReserveIn := new(big.Float).SetPrec(256).SetFloat64(reserveInFloat)
+	fReserveOut := new(big.Float).SetPrec(256).SetFloat64(reserveOutFloat)
+	fFee := new(big.Float).SetPrec(256).SetFloat64(fee)
+	k := new(big.Float).Mul(fReserveIn, fReserveOut)
+	sqrtK := new(big.Float).Sqrt(k)
+	sqrtFee := new(big.Float).Sqrt(fFee)
+	optimal := new(big.Float).Sub(new(big.Float).Quo(sqrtK, sqrtFee), fReserveIn)
+	if optimal.Sign() <= 0 {
+		return big.NewInt(0)
+	}
+	res := new(big.Int)
+	optimal.Int(res)
+	return res
+}
+
 func computeOptimalAmount2Hop(pool0, pool1 *types.PoolState, start common.Address) *big.Int {
-	// Only works for V2 constant product pools (Aerodrome V2, AlienBase V2)
+	if pool0 == nil || pool1 == nil {
+		return nil
+	}
 	if pool0.DexType == types.DexUniswapV3 || pool0.DexType == types.DexPancakeV3 ||
 		pool1.DexType == types.DexUniswapV3 || pool1.DexType == types.DexPancakeV3 {
 		return nil
 	}
-	// Skip stable pools
 	if isStableV2Pool(pool0) || isStableV2Pool(pool1) {
 		return nil
 	}
-
 	r0, _ := pool0.GetReserves()
-	r1, _ := pool0.GetReserves()
+	r1, _ := pool1.GetReserves()
 	var reserveStart0, reserveOther0 float64
 	if pool0.Token0 == start {
 		reserveStart0 = r0
@@ -394,68 +462,82 @@ func computeOptimalAmount2Hop(pool0, pool1 *types.PoolState, start common.Addres
 	if reserveStart0 <= 0 || reserveStart1 <= 0 || reserveOther0 <= 0 {
 		return nil
 	}
-
 	fee0 := 1.0 - float64(pool0.FeeBps)/10000.0
 	fee1 := 1.0 - float64(pool1.FeeBps)/10000.0
 	if fee0 <= 0 || fee1 <= 0 {
 		return nil
 	}
-
-	product := reserveStart0 * reserveStart1 * fee0 * fee1
-	denom := 1 - fee0*fee1
-	if denom <= 0 {
+	fR0 := new(big.Float).SetPrec(256).SetFloat64(reserveStart0)
+	fR1 := new(big.Float).SetPrec(256).SetFloat64(reserveStart1)
+	fFee0 := new(big.Float).SetPrec(256).SetFloat64(fee0)
+	fFee1 := new(big.Float).SetPrec(256).SetFloat64(fee1)
+	product := new(big.Float).Mul(
+		new(big.Float).Mul(fR0, fR1),
+		new(big.Float).Mul(fFee0, fFee1),
+	)
+	feeProduct := new(big.Float).Mul(fFee0, fFee1)
+	denom := new(big.Float).Sub(big.NewFloat(1), feeProduct)
+	if denom.Sign() <= 0 {
 		return nil
 	}
-	optimal := math.Sqrt(product/denom) - reserveStart0
-	if optimal <= 0 {
+	ratio := new(big.Float).Quo(product, denom)
+	sqrt := new(big.Float).Sqrt(ratio)
+	optimal := new(big.Float).Sub(sqrt, fR0)
+	if optimal.Sign() <= 0 {
 		return nil
 	}
-
-	f := floatPool.Get().(*big.Float)
-	f.SetFloat64(optimal)
 	res := new(big.Int)
-	f.Int(res)
-	floatPool.Put(f)
+	optimal.Int(res)
 	return res
 }
 
-// computeOptimalAmount3Hop uses golden‑section search for 3‑hop V2 routes.
 func computeOptimalAmount3Hop(
 	p0, p1, p2 *types.PoolState,
 	start, mid1, mid2 common.Address,
 	priceStart float64,
 ) *big.Int {
+	if p0 == nil || p1 == nil || p2 == nil {
+		return nil
+	}
+	if isStableV2Pool(p0) || isStableV2Pool(p1) || isStableV2Pool(p2) {
+		return nil
+	}
 	base := computeOptimalInputRaw(p0, start)
 	if base.Sign() <= 0 {
 		return nil
 	}
-	baseF, _ := base.Float64()
+	baseF, _ := new(big.Float).SetInt(base).Float64()
+	if baseF <= 0 {
+		return nil
+	}
 	low := 0.0
 	high := baseF * 10.0
 	if high <= 0 {
 		return nil
 	}
+	dec := getTokenDecimals(start)
 	profitFn := func(amount float64) float64 {
 		amt := new(big.Int).SetInt64(int64(amount))
 		out0 := new(big.Int)
-		if err := computeSwap(p0, start, mid1, amt, out0); err != nil || out0.Sign() <= 0 {
+		if err := ComputeSwap(p0, start, mid1, amt, out0); err != nil || out0.Sign() <= 0 {
 			return -1e9
 		}
 		out1 := new(big.Int)
-		if err := computeSwap(p1, mid1, mid2, out0, out1); err != nil || out1.Sign() <= 0 {
+		if err := ComputeSwap(p1, mid1, mid2, out0, out1); err != nil || out1.Sign() <= 0 {
 			return -1e9
 		}
 		out2 := new(big.Int)
-		if err := computeSwap(p2, mid2, start, out1, out2); err != nil || out2.Sign() <= 0 {
+		if err := ComputeSwap(p2, mid2, start, out1, out2); err != nil || out2.Sign() <= 0 {
 			return -1e9
 		}
 		net := new(big.Int).Sub(out2, amt)
 		if net.Sign() <= 0 {
 			return -1e9
 		}
-		netF, _ := new(big.Float).SetInt(net).Float64()
-		dec := getTokenDecimals(start)
-		return (netF / math.Pow10(dec)) * priceStart
+		netF := new(big.Float).SetInt(net)
+		div := new(big.Float).SetFloat64(math.Pow10(dec))
+		profitUSD, _ := new(big.Float).Mul(new(big.Float).Quo(netF, div), big.NewFloat(priceStart)).Float64()
+		return profitUSD
 	}
 	const phi = 1.618033988749895
 	for i := 0; i < 30; i++ {
@@ -473,16 +555,13 @@ func computeOptimalAmount3Hop(
 	if opt <= 0 {
 		return nil
 	}
-	f := floatPool.Get().(*big.Float)
-	f.SetFloat64(opt)
-	res := new(big.Int)
-	f.Int(res)
-	floatPool.Put(f)
-	return res
+	return new(big.Int).SetInt64(int64(opt))
 }
 
-// computeOptimalAmountV3 uses golden‑section search for a single V3 swap.
 func computeOptimalAmountV3(pool *types.PoolState, tokenIn, tokenOut common.Address, priceIn float64) *big.Int {
+	if pool == nil {
+		return nil
+	}
 	if pool.DexType != types.DexUniswapV3 && pool.DexType != types.DexPancakeV3 {
 		return nil
 	}
@@ -490,25 +569,30 @@ func computeOptimalAmountV3(pool *types.PoolState, tokenIn, tokenOut common.Addr
 	if base.Sign() <= 0 {
 		return nil
 	}
-	baseF, _ := base.Float64()
+	baseF, _ := new(big.Float).SetInt(base).Float64()
+	if baseF <= 0 {
+		return nil
+	}
 	low := 0.0
 	high := baseF * 10.0
 	if high <= 0 {
 		return nil
 	}
+	dec := getTokenDecimals(tokenIn)
 	profitFn := func(amount float64) float64 {
 		amt := new(big.Int).SetInt64(int64(amount))
 		out := new(big.Int)
-		if err := computeSwap(pool, tokenIn, tokenOut, amt, out); err != nil || out.Sign() <= 0 {
+		if err := ComputeSwap(pool, tokenIn, tokenOut, amt, out); err != nil || out.Sign() <= 0 {
 			return -1e9
 		}
 		net := new(big.Int).Sub(out, amt)
 		if net.Sign() <= 0 {
 			return -1e9
 		}
-		netF, _ := new(big.Float).SetInt(net).Float64()
-		dec := getTokenDecimals(tokenIn)
-		return (netF / math.Pow10(dec)) * priceIn
+		netF := new(big.Float).SetInt(net)
+		div := new(big.Float).SetFloat64(math.Pow10(dec))
+		profitUSD, _ := new(big.Float).Mul(new(big.Float).Quo(netF, div), big.NewFloat(priceIn)).Float64()
+		return profitUSD
 	}
 	const phi = 1.618033988749895
 	for i := 0; i < 30; i++ {
@@ -526,20 +610,9 @@ func computeOptimalAmountV3(pool *types.PoolState, tokenIn, tokenOut common.Addr
 	if opt <= 0 {
 		return nil
 	}
-	f := floatPool.Get().(*big.Float)
-	f.SetFloat64(opt)
-	res := new(big.Int)
-	f.Int(res)
-	floatPool.Put(f)
-	return res
+	return new(big.Int).SetInt64(int64(opt))
 }
 
-
-// =============================================================================
-//  CANDIDATE GENERATION (2‑HOP, 3‑HOP, WITH OPTIMAL SIZING)
-// =============================================================================
-
-// tryMultipliers tries a range of input multipliers around the optimal amount.
 func tryMultipliers(
 	start, middle, end common.Address,
 	baseAmount *big.Int,
@@ -559,43 +632,37 @@ func tryMultipliers(
 	bestCand := (*types.RouteCandidate)(nil)
 	bestProfit := 0.0
 	var amountIn, outMid, outStart, netWei, minOut0, minOut1 big.Int
-
-	// For early break detection.
 	prevProfit := -1.0
 
 	for _, mul := range multipliers {
-	 if optimalAmount != nil && optimalAmount.Sign() > 0 {
-        amountIn.Set(optimalAmount)
-    } else {
-        amountIn.Set(baseAmount)
-    }
+		if optimalAmount != nil && optimalAmount.Sign() > 0 {
+			amountIn.Set(optimalAmount)
+		} else {
+			amountIn.Set(baseAmount)
+		}
 		scaled := int64(mul * 100)
 		amountIn.Mul(&amountIn, big.NewInt(scaled))
 		amountIn.Div(&amountIn, big.NewInt(100))
 		if amountIn.Sign() <= 0 {
 			continue
 		}
-
-		if err := computeSwap(pool0, start, middle, &amountIn, &outMid); err != nil {
+		if err := ComputeSwap(pool0, start, middle, &amountIn, &outMid); err != nil {
 			continue
 		}
-		if err := computeSwap(pool1, middle, start, &outMid, &outStart); err != nil {
+		if err := ComputeSwap(pool1, middle, start, &outMid, &outStart); err != nil {
 			continue
 		}
 		netWei.Sub(&outStart, &amountIn)
 		if netWei.Sign() <= 0 {
 			continue
 		}
-		priceStart := GetTokenPrice(start, matrix, cache)
-		if priceStart <= 0 {
+		priceStart, ok := GetTokenPrice(start, matrix, cache)
+		if !ok || priceStart <= 0 {
 			continue
 		}
 		decStart := getTokenDecimals(start)
 		grossProfitUSD := (float64FromBig(&netWei) / math.Pow10(decStart)) * priceStart
-		cand := &types.RouteCandidate{Hops: 2}
-		gasCostUSD := GetCurrentGasCostUSD() * float64(estimateGasForCandidate(cand))
-		profitUSD := grossProfitUSD - gasCostUSD
-		if profitUSD < cfg.MinProfitUSD {
+		if grossProfitUSD < cfg.MinProfitUSD {
 			continue
 		}
 		applySlippageBuffer(&outMid, &minOut0)
@@ -608,26 +675,25 @@ func tryMultipliers(
 			DexTypes:          [3]types.DexType{pool0.DexType, pool1.DexType, 0},
 			ZeroForOnes:       [3]bool{forwardZeroForOne, reverseZeroForOne, false},
 			MinOuts:           [3]*big.Int{new(big.Int).Set(&minOut0), new(big.Int).Set(&minOut1), new(big.Int)},
+			FeeBps:            [3]uint32{pool0.FeeBps, pool1.FeeBps, 0},
 			AmountIn:          new(big.Int).Set(&amountIn),
-			ExpectedProfitUSD: profitUSD,
+			ExpectedProfitUSD: grossProfitUSD,
 			NetProfitWei:      new(big.Int).Set(&netWei),
 			ExecutionSlippage: 0,
 			Competition:       0,
 		}
-		if bestCand == nil || profitUSD > bestProfit {
+		if bestCand == nil || grossProfitUSD > bestProfit {
 			bestCand = candidate
-			bestProfit = profitUSD
+			bestProfit = grossProfitUSD
 		}
-		// Early break: if profit decreased from previous, we likely passed the peak.
-		if prevProfit >= 0 && profitUSD < prevProfit {
+		if prevProfit >= 0 && grossProfitUSD < prevProfit {
 			break
 		}
-		prevProfit = profitUSD
+		prevProfit = grossProfitUSD
 	}
 	return bestCand
 }
 
-// buildRoundTrip2Hop – uses optimalAmount for V2 or V3.
 func buildRoundTrip2Hop(start, middle common.Address, matrix *state.Matrix, cfg *config.Config, cache *sync.Map) *types.RouteCandidate {
 	if start == middle {
 		return nil
@@ -656,7 +722,11 @@ func buildRoundTrip2Hop(start, middle common.Address, matrix *state.Matrix, cfg 
 		}
 		var optimalAmount *big.Int
 		if fwdPool.DexType == types.DexUniswapV3 || fwdPool.DexType == types.DexPancakeV3 {
-			optimalAmount = computeOptimalAmountV3(fwdPool, start, middle, GetTokenPrice(start, matrix, cache))
+			priceStart, ok := GetTokenPrice(start, matrix, cache)
+			if !ok || priceStart <= 0 {
+				continue
+			}
+			optimalAmount = computeOptimalAmountV3(fwdPool, start, middle, priceStart)
 		} else {
 			optimalAmount = computeOptimalAmount2Hop(fwdPool, revPool, start)
 		}
@@ -671,12 +741,6 @@ func buildRoundTrip2Hop(start, middle common.Address, matrix *state.Matrix, cfg 
 	return bestCand
 }
 
-
-
-
-
-
-// buildRoundTrip3Hop – uses optimalAmount for V2 or V3 (single-hop guide).
 func buildRoundTrip3Hop(start, mid1, mid2 common.Address, matrix *state.Matrix, cfg *config.Config, cache *sync.Map) *types.RouteCandidate {
 	if start == mid1 || start == mid2 || mid1 == mid2 {
 		return nil
@@ -704,12 +768,11 @@ func buildRoundTrip3Hop(start, mid1, mid2 common.Address, matrix *state.Matrix, 
 	if baseAmount.Sign() <= 0 {
 		return nil
 	}
-	priceStart := GetTokenPrice(start, matrix, cache)
-	if priceStart <= 0 {
+	priceStart, ok := GetTokenPrice(start, matrix, cache)
+	if !ok || priceStart <= 0 {
 		return nil
 	}
 
-	// Compute optimal amount for this route.
 	var optimalAmount *big.Int
 	if p0.DexType == types.DexUniswapV3 || p0.DexType == types.DexPancakeV3 {
 		optimalAmount = computeOptimalAmountV3(p0, start, mid1, priceStart)
@@ -733,29 +796,26 @@ func buildRoundTrip3Hop(start, mid1, mid2 common.Address, matrix *state.Matrix, 
 		if amountIn.Sign() <= 0 {
 			continue
 		}
-		if err := computeSwap(p0, start, mid1, &amountIn, &out0); err != nil {
+		if err := ComputeSwap(p0, start, mid1, &amountIn, &out0); err != nil {
 			continue
 		}
-		if err := computeSwap(p1, mid1, mid2, &out0, &out1); err != nil {
+		if err := ComputeSwap(p1, mid1, mid2, &out0, &out1); err != nil {
 			continue
 		}
-		if err := computeSwap(p2, mid2, start, &out1, &out2); err != nil {
+		if err := ComputeSwap(p2, mid2, start, &out1, &out2); err != nil {
 			continue
 		}
 		netWei.Sub(&out2, &amountIn)
 		if netWei.Sign() <= 0 {
 			continue
 		}
-		priceStart := GetTokenPrice(start, matrix, cache)
-		if priceStart <= 0 {
+		priceStart, ok := GetTokenPrice(start, matrix, cache)
+		if !ok || priceStart <= 0 {
 			continue
 		}
 		decStart := getTokenDecimals(start)
 		grossProfitUSD := (float64FromBig(&netWei) / math.Pow10(decStart)) * priceStart
-		cand := &types.RouteCandidate{Hops: 3}
-		gasCostUSD := GetCurrentGasCostUSD() * float64(estimateGasForCandidate(cand))
-		profitUSD := grossProfitUSD - gasCostUSD
-		if profitUSD < cfg.MinProfitUSD {
+		if grossProfitUSD < cfg.MinProfitUSD {
 			continue
 		}
 		applySlippageBuffer(&out0, &minOut0)
@@ -769,62 +829,22 @@ func buildRoundTrip3Hop(start, mid1, mid2 common.Address, matrix *state.Matrix, 
 			DexTypes:          [3]types.DexType{p0.DexType, p1.DexType, p2.DexType},
 			ZeroForOnes:       [3]bool{zeroForOne0, zeroForOne1, zeroForOne2},
 			MinOuts:           [3]*big.Int{new(big.Int).Set(&minOut0), new(big.Int).Set(&minOut1), new(big.Int).Set(&minOut2)},
+			FeeBps:            [3]uint32{p0.FeeBps, p1.FeeBps, p2.FeeBps},
 			AmountIn:          new(big.Int).Set(&amountIn),
-			ExpectedProfitUSD: profitUSD,
+			ExpectedProfitUSD: grossProfitUSD,
 			NetProfitWei:      new(big.Int).Set(&netWei),
 			ExecutionSlippage: 0,
 			Competition:       0,
 		}
-		if bestCand == nil || profitUSD > bestProfit {
+		if bestCand == nil || grossProfitUSD > bestProfit {
 			bestCand = candidate
-			bestProfit = profitUSD
+			bestProfit = grossProfitUSD
 		}
 	}
 	return bestCand
 }
-// =============================================================================
-//  HELPER FUNCTIONS (unchanged)
-// =============================================================================
 
-// computeOptimalInputRaw computes the optimal single-hop input in raw units.
-func computeOptimalInputRaw(pool *types.PoolState, tokenIn common.Address) *big.Int {
-	if pool == nil {
-		return big.NewInt(0)
-	}
-	r0, r1 := pool.GetReserves()
-	if r0 <= 0 || r1 <= 0 {
-		return big.NewInt(0)
-	}
-	var reserveInFloat, reserveOutFloat float64
-	if tokenIn == pool.Token0 {
-		reserveInFloat = r0
-		reserveOutFloat = r1
-	} else if tokenIn == pool.Token1 {
-		reserveInFloat = r1
-		reserveOutFloat = r0
-	} else {
-		return big.NewInt(0)
-	}
-	if reserveInFloat <= 0 || reserveOutFloat <= 0 {
-		return big.NewInt(0)
-	}
-	fee := getFeeFactor(pool)
-	k := reserveInFloat * reserveOutFloat
-	sqrtK := math.Sqrt(k)
-	amountInFloat := sqrtK/math.Sqrt(fee) - reserveInFloat
-	if amountInFloat <= 0 {
-		return big.NewInt(0)
-	}
-	f := floatPool.Get().(*big.Float)
-	f.SetFloat64(amountInFloat)
-	res := new(big.Int)
-	f.Int(res)
-	floatPool.Put(f)
-	return res
-}
-
-// computeSwap calculates the output amount for a swap.
-func computeSwap(pool *types.PoolState, tokenIn, tokenOut common.Address, amountIn *big.Int, result *big.Int) error {
+func ComputeSwap(pool *types.PoolState, tokenIn, tokenOut common.Address, amountIn *big.Int, result *big.Int) error {
 	if amountIn == nil || amountIn.Sign() <= 0 {
 		result.SetInt64(0)
 		return nil
@@ -834,7 +854,6 @@ func computeSwap(pool *types.PoolState, tokenIn, tokenOut common.Address, amount
 		defer v3CalcPool.Put(calc)
 		return calc.ComputeSwap(pool, tokenIn, tokenOut, amountIn, result)
 	}
-	// V2 style
 	r0, r1 := pool.GetReserves()
 	if r0 <= 0 || r1 <= 0 {
 		return fmt.Errorf("zero reserves")
@@ -865,7 +884,6 @@ func computeSwap(pool *types.PoolState, tokenIn, tokenOut common.Address, amount
 	return nil
 }
 
-// getFeeFactor returns the fee multiplier for a pool.
 func getFeeFactor(pool *types.PoolState) float64 {
 	feeBps := pool.FeeBps
 	if feeBps == 0 {
@@ -877,7 +895,6 @@ func getFeeFactor(pool *types.PoolState) float64 {
 	return 1.0 - float64(feeBps)/10000.0
 }
 
-// applySlippageBuffer writes the slippage-buffered amount into 'out'.
 func applySlippageBuffer(amount *big.Int, out *big.Int) {
 	if amount == nil || amount.Sign() <= 0 {
 		out.SetInt64(0)
@@ -890,81 +907,90 @@ func applySlippageBuffer(amount *big.Int, out *big.Int) {
 	floatPool.Put(f)
 }
 
-// GetTokenPrice returns USD price using the matrix, with an optional per‑event cache.
-func GetTokenPrice(token common.Address, matrix *state.Matrix, cache *sync.Map) float64 {
-	if cache != nil {
-		if v, ok := cache.Load(token); ok {
-			return v.(float64)
-		}
-	}
-	if token == config.USDCAddress || token == config.USDBCAddress {
-		price := 1.0
-		if cache != nil {
-			cache.Store(token, price)
-		}
-		return price
-	}
-	if token == config.WETHAddress {
-		pools := matrix.GetPoolsForPair(config.WETHAddress, config.USDCAddress)
-		if len(pools) > 0 {
-			pool := pools[0]
-			if pool.GetLiquidity() > 0 {
-				price := getPriceFromPool(pool, token)
-				if price > 0 {
-					if cache != nil {
-						cache.Store(token, price)
-					}
-					return price
-				}
-			}
-		}
-		return 0.0
-	}
-	if token == config.CBBTCAddress {
-		pools := matrix.GetPoolsForPair(config.CBBTCAddress, config.USDCAddress)
-		if len(pools) > 0 {
-			pool := pools[0]
-			if pool.GetLiquidity() > 0 {
-				price := getPriceFromPool(pool, token)
-				if price > 0 {
-					if cache != nil {
-						cache.Store(token, price)
-					}
-					return price
-				}
-			}
-		}
-		return 0.0
-	}
-	anchors := config.AnchorAssets()
-	for _, anchor := range anchors {
-		if anchor == token {
-			continue
-		}
-		pools := matrix.GetPoolsForPair(token, anchor)
-		if len(pools) > 0 {
-			pool := pools[0]
-			anchorPrice := GetTokenPrice(anchor, matrix, cache)
-			if anchorPrice <= 0 {
-				continue
-			}
-			priceInAnchor := getPriceFromPool(pool, token)
-			if priceInAnchor <= 0 {
-				continue
-			}
-			price := priceInAnchor * anchorPrice
-			if price > 0 {
-				if cache != nil {
-					cache.Store(token, price)
-				}
-				return price
-			}
-		}
-	}
-	return 0.0
-}
+// GetTokenPrice returns the USD price of a token and a boolean indicating success.
+// The price cache entries expire after 1 second.
+// Uses a per‑token mutex to prevent duplicate computation.
+func GetTokenPrice(token common.Address, matrix *state.Matrix, cache *sync.Map) (float64, bool) {
+    now := time.Now().UnixNano()
 
-// getPriceFromPool computes the price of token in terms of the other token.
+    // Fast path: read from cache (read‑only, no lock needed)
+    if cache != nil {
+        if v, ok := cache.Load(token); ok {
+            if entry, ok := v.(*PriceEntry); ok {
+                if now-entry.Timestamp < int64(time.Second) {
+                    return entry.Price, true
+                }
+            }
+        }
+    }
+
+    // Acquire per‑token lock to prevent duplicate computation
+    mu := getPriceLock(token)
+    mu.Lock()
+    defer mu.Unlock()
+
+    // Double‑check after acquiring lock
+    if cache != nil {
+        if v, ok := cache.Load(token); ok {
+            if entry, ok := v.(*PriceEntry); ok {
+                if now-entry.Timestamp < int64(time.Second) {
+                    return entry.Price, true
+                }
+            }
+        }
+    }
+
+    // ---- Compute price (unchanged logic) ----
+    var price float64
+    if token == config.USDCAddress || token == config.USDBCAddress {
+        price = 1.0
+    } else if token == config.WETHAddress {
+        pools := matrix.GetPoolsForPair(config.WETHAddress, config.USDCAddress)
+        if len(pools) > 0 {
+            pool := pools[0]
+            if pool.GetLiquidity() > 0 {
+                price = getPriceFromPool(pool, token)
+            }
+        }
+    } else if token == config.CBBTCAddress {
+        pools := matrix.GetPoolsForPair(config.CBBTCAddress, config.USDCAddress)
+        if len(pools) > 0 {
+            pool := pools[0]
+            if pool.GetLiquidity() > 0 {
+                price = getPriceFromPool(pool, token)
+            }
+        }
+    } else {
+        anchors := config.AnchorAssets()
+        for _, anchor := range anchors {
+            if anchor == token {
+                continue
+            }
+            pools := matrix.GetPoolsForPair(token, anchor)
+            if len(pools) > 0 {
+                pool := pools[0]
+                anchorPrice, ok := GetTokenPrice(anchor, matrix, cache)
+                if !ok || anchorPrice <= 0 {
+                    continue
+                }
+                priceInAnchor := getPriceFromPool(pool, token)
+                if priceInAnchor <= 0 {
+                    continue
+                }
+                price = priceInAnchor * anchorPrice
+                break
+            }
+        }
+    }
+
+    if price > 0 {
+        if cache != nil {
+            cache.Store(token, &PriceEntry{Price: price, Timestamp: now})
+        }
+        return price, true
+    }
+    return 0, false
+}
 func getPriceFromPool(pool *types.PoolState, token common.Address) float64 {
 	if pool == nil {
 		return 0
@@ -996,8 +1022,13 @@ func getPriceFromPool(pool *types.PoolState, token common.Address) float64 {
 	return price
 }
 
-// getTokenDecimals returns decimals for known tokens.
-func getTokenDecimals(token common.Address) int {
+func GetTokenDecimals(token common.Address) int {
+	decimalsCache.RLock()
+	if d, ok := decimalsCache.m[token]; ok {
+		decimalsCache.RUnlock()
+		return int(d)
+	}
+	decimalsCache.RUnlock()
 	if token == config.USDCAddress || token == config.USDBCAddress {
 		return 6
 	}
@@ -1010,7 +1041,12 @@ func getTokenDecimals(token common.Address) int {
 	return 18
 }
 
-// float64FromBig converts a big.Int to float64 using a pooled big.Float.
+func SetTokenDecimals(token common.Address, decimals uint8) {
+	decimalsCache.Lock()
+	defer decimalsCache.Unlock()
+	decimalsCache.m[token] = decimals
+}
+
 func float64FromBig(v *big.Int) float64 {
 	if v == nil {
 		return 0
@@ -1020,4 +1056,9 @@ func float64FromBig(v *big.Int) float64 {
 	val, _ := f.Float64()
 	floatPool.Put(f)
 	return val
+}
+
+// getTokenDecimals (local version – kept for internal use; prefer GetTokenDecimals)
+func getTokenDecimals(token common.Address) int {
+	return GetTokenDecimals(token)
 }
