@@ -119,7 +119,10 @@ func (c *LRUCache) Put(token common.Address) {
 	for i := 0; i < n; i++ {
 		ent := &c.slots[i]
 		if ent.Gen.Load() == 0 {
-			ent.Token.Store(&addr) // Set pointer value BEFORE opening the slot
+			// Allocate a new address pointer for the slot (only once per slot)
+			addrPtr := new(common.Address)
+			*addrPtr = token
+			ent.Token.Store(addrPtr)
 			ent.Visited.Store(1)
 			if ent.Gen.CompareAndSwap(0, 1) {
 				return
@@ -145,8 +148,17 @@ func (c *LRUCache) Put(token common.Address) {
 			continue
 		}
 
-		// FIXED: Stage values inside the slot structures BEFORE incrementing Gen
-		ent.Token.Store(&addr)
+		// Reuse the existing pointer (which is non‑nil) – update the value it points to.
+		ptr := ent.Token.Load()
+		if ptr != nil {
+			*ptr = token
+		} else {
+			// Shouldn't happen, but handle safely
+			addrPtr := new(common.Address)
+			*addrPtr = token
+			ent.Token.Store(addrPtr)
+		}
+
 		ent.Visited.Store(1)
 
 		if ent.Gen.CompareAndSwap(oldGen, oldGen+1) {
@@ -156,7 +168,6 @@ func (c *LRUCache) Put(token common.Address) {
 		// If CAS fails, another routine won the slot; loop back around safely
 	}
 }
-
 // Len returns the number of occupied slots (for debugging).
 func (c *LRUCache) Len() int {
 	count := 0
