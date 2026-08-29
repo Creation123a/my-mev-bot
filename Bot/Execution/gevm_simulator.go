@@ -298,96 +298,103 @@ func setERC20Balance(stateDB *gethstate.StateDB, token, holder common.Address, a
 
 // injectPoolState now also injects V3 tick data.
 func (g *GEVMSimulator) injectPoolState(stateDB *gethstate.StateDB, pool *types.PoolState) {
-	if pool == nil {
-		return
-	}
-	pool.RLock()
-	defer pool.RUnlock()
+    if pool == nil {
+        return
+    }
+    pool.RLock()
+    defer pool.RUnlock()
 
-	// V2 reserves
-	if pool.DexType == types.DexAerodromeV2 || pool.DexType == types.DexAlienBaseV2 {
-		stateDB.SetState(pool.PoolAddress, common.BigToHash(big.NewInt(0)), common.BigToHash(pool.Reserve0))
-		stateDB.SetState(pool.PoolAddress, common.BigToHash(big.NewInt(1)), common.BigToHash(pool.Reserve1))
-		stateDB.SetState(pool.PoolAddress, common.BigToHash(big.NewInt(2)), common.BigToHash(big.NewInt(time.Now().Unix())))
-		setERC20Balance(stateDB, pool.Token0, pool.PoolAddress, pool.Reserve0)
-		setERC20Balance(stateDB, pool.Token1, pool.PoolAddress, pool.Reserve1)
-		return
-	}
+    // V2 reserves
+    if pool.DexType == types.DexAerodromeV2 || pool.DexType == types.DexAlienBaseV2 {
+        stateDB.SetState(pool.PoolAddress, common.BigToHash(big.NewInt(0)), common.BigToHash(pool.Reserve0))
+        stateDB.SetState(pool.PoolAddress, common.BigToHash(big.NewInt(1)), common.BigToHash(pool.Reserve1))
+        stateDB.SetState(pool.PoolAddress, common.BigToHash(big.NewInt(2)), common.BigToHash(big.NewInt(time.Now().Unix())))
+        setERC20Balance(stateDB, pool.Token0, pool.PoolAddress, pool.Reserve0)
+        setERC20Balance(stateDB, pool.Token1, pool.PoolAddress, pool.Reserve1)
+        return
+    }
 
-	// V3: slot0
-	if pool.Slot0Packed != nil && pool.Slot0Packed.Sign() != 0 {
-		stateDB.SetState(pool.PoolAddress, common.BigToHash(big.NewInt(0)), common.BigToHash(pool.Slot0Packed))
-	} else {
-		packed := new(big.Int).Set(pool.SqrtPriceX96)
-		tickVal := uint64(int64(pool.Tick)) & 0xFFFFFF
-		tickBig := new(big.Int).SetUint64(tickVal)
-		tickBig.Lsh(tickBig, 160)
-		packed.Or(packed, tickBig)
-		cardBig := new(big.Int).SetUint64(1)
-		cardBig.Lsh(cardBig, 200)
-		packed.Or(packed, cardBig)
-		cardNextBig := new(big.Int).SetUint64(1)
-		cardNextBig.Lsh(cardNextBig, 216)
-		packed.Or(packed, cardNextBig)
-		unlockedBit := new(big.Int).Lsh(big.NewInt(1), 240)
-		packed.Or(packed, unlockedBit)
-		stateDB.SetState(pool.PoolAddress, common.BigToHash(big.NewInt(0)), common.BigToHash(packed))
-	}
+    // V3: slot0
+    if pool.Slot0Packed != nil && pool.Slot0Packed.Sign() != 0 {
+        stateDB.SetState(pool.PoolAddress, common.BigToHash(big.NewInt(0)), common.BigToHash(pool.Slot0Packed))
+    } else {
+        packed := new(big.Int).Set(pool.SqrtPriceX96)
+        tickVal := uint64(int64(pool.Tick)) & 0xFFFFFF
+        tickBig := new(big.Int).SetUint64(tickVal)
+        tickBig.Lsh(tickBig, 160)
+        packed.Or(packed, tickBig)
+        cardBig := new(big.Int).SetUint64(1)
+        cardBig.Lsh(cardBig, 200)
+        packed.Or(packed, cardBig)
+        cardNextBig := new(big.Int).SetUint64(1)
+        cardNextBig.Lsh(cardNextBig, 216)
+        packed.Or(packed, cardNextBig)
+        unlockedBit := new(big.Int).Lsh(big.NewInt(1), 240)
+        packed.Or(packed, unlockedBit)
+        stateDB.SetState(pool.PoolAddress, common.BigToHash(big.NewInt(0)), common.BigToHash(packed))
+    }
 
-	// slot1: liquidity
-	stateDB.SetState(pool.PoolAddress, common.BigToHash(big.NewInt(1)), common.BigToHash(pool.Liquidity))
+    // slot1: liquidity
+    stateDB.SetState(pool.PoolAddress, common.BigToHash(big.NewInt(1)), common.BigToHash(pool.Liquidity))
 
-	// feeGrowth defaults
-	hugeFee := new(big.Int).Exp(big.NewInt(10), big.NewInt(36), nil)
-	stateDB.SetState(pool.PoolAddress, common.BigToHash(big.NewInt(2)), common.BigToHash(hugeFee))
-	stateDB.SetState(pool.PoolAddress, common.BigToHash(big.NewInt(3)), common.BigToHash(hugeFee))
-	stateDB.SetState(pool.PoolAddress, common.BigToHash(big.NewInt(4)), common.BigToHash(new(big.Int)))
+    // feeGrowth defaults
+    hugeFee := new(big.Int).Exp(big.NewInt(10), big.NewInt(36), nil)
+    stateDB.SetState(pool.PoolAddress, common.BigToHash(big.NewInt(2)), common.BigToHash(hugeFee))
+    stateDB.SetState(pool.PoolAddress, common.BigToHash(big.NewInt(3)), common.BigToHash(hugeFee))
+    stateDB.SetState(pool.PoolAddress, common.BigToHash(big.NewInt(4)), common.BigToHash(new(big.Int)))
 
-	// huge balances for the pool
-	huge := new(big.Int).Exp(big.NewInt(10), big.NewInt(30), nil)
-	setERC20Balance(stateDB, pool.Token0, pool.PoolAddress, huge)
-	setERC20Balance(stateDB, pool.Token1, pool.PoolAddress, huge)
+    // huge balances for the pool
+    huge := new(big.Int).Exp(big.NewInt(10), big.NewInt(30), nil)
+    setERC20Balance(stateDB, pool.Token0, pool.PoolAddress, huge)
+    setERC20Balance(stateDB, pool.Token1, pool.PoolAddress, huge)
 
-	// ---- NEW: Inject V3 tick bitmap and ticks ----
-	pool.tickMu.RLock()
-	bitmap := pool.TickBitmap
-	liquidityNet := pool.LiquidityNet
-	pool.tickMu.RUnlock()
+    // ---- V3 tick bitmap and ticks (CORRECTED) ----
+    pool.TickMu.RLock()
+    bitmap := pool.TickBitmap
+    liquidityNet := pool.LiquidityNet
+    pool.TickMu.RUnlock()
 
-	if len(bitmap) > 0 {
-		// TickBitmap is mapping(int16 => uint256) at slot 3.
-		// Treat bitmap as concatenated 32-byte words (word index = i)
-		numWords := len(bitmap) / 32
-		for i := 0; i < numWords; i++ {
-			word := new(big.Int).SetBytes(bitmap[i*32 : (i+1)*32])
-			if word.Sign() == 0 {
-				continue
-			}
-			// storage key = keccak256(abi.encodePacked(uint16(i), uint256(3)))
-			key := crypto.Keccak256(abi.Pack(int16(i), big.NewInt(3)))
-			stateDB.SetState(pool.PoolAddress, common.BytesToHash(key), common.BigToHash(word))
-		}
-	}
+    // TickBitmap mapping(int16 => uint256) at slot 3
+    if len(bitmap) > 0 {
+        for wordIndex, word := range bitmap {
+            if word == nil || word.Sign() == 0 {
+                continue
+            }
+            // key = keccak256(abi.encodePacked(int16(wordIndex), uint256(3)))
+            packedKey := append(
+                common.BigToHash(big.NewInt(int64(wordIndex))).Bytes()[14:],
+                common.BigToHash(big.NewInt(3)).Bytes()...,
+            )
+            key := common.BytesToHash(crypto.Keccak256(packedKey))
+            stateDB.SetState(pool.PoolAddress, key, common.BigToHash(word))
+        }
+    }
 
-	if len(liquidityNet) > 0 {
-		// Ticks mapping(int24 => Tick.Info) at slot 2.
-		// We only set liquidityNet (second field, offset +1)
-		for tick, liqNet := range liquidityNet {
-			if liqNet == nil || liqNet.Sign() == 0 {
-				continue
-			}
-			// base key = keccak256(abi.encodePacked(int24(tick), uint256(2)))
-			baseKey := crypto.Keccak256(abi.Pack(int24(tick), big.NewInt(2)))
-			// liquidityNet is at baseKey + 1
-			slotHash := common.BytesToHash(baseKey)
-			slotBig := new(big.Int).SetBytes(slotHash.Bytes())
-			slotBig.Add(slotBig, big.NewInt(1))
-			slotKey := common.BigToHash(slotBig)
-			stateDB.SetState(pool.PoolAddress, slotKey, common.BigToHash(liqNet))
-		}
-	}
+    // Ticks mapping(int24 => Tick.Info) at slot 2
+    if len(liquidityNet) > 0 {
+        for tick, liqNet := range liquidityNet {
+            if liqNet == nil || liqNet.Sign() == 0 {
+                continue
+            }
+            // base key = keccak256(abi.encodePacked(int24(tick), uint256(2)))
+            tickBytes := make([]byte, 3)
+            tickVal := int32(tick)
+            tickBytes[0] = byte(tickVal >> 16)
+            tickBytes[1] = byte(tickVal >> 8)
+            tickBytes[2] = byte(tickVal)
+            packedKey := append(
+                tickBytes,
+                common.BigToHash(big.NewInt(2)).Bytes()...,
+            )
+            baseKey := common.BytesToHash(crypto.Keccak256(packedKey))
+            // liquidityNet is at baseKey + 1
+            slotBig := new(big.Int).SetBytes(baseKey.Bytes())
+            slotBig.Add(slotBig, big.NewInt(1))
+            slotKey := common.BigToHash(slotBig)
+            stateDB.SetState(pool.PoolAddress, slotKey, common.BigToHash(liqNet))
+        }
+    }
 }
-
 func (g *GEVMSimulator) SimulateNative(payload *types.ExecutionPayload) (bool, uint64, error) {
 	if payload == nil || payload.Calldata == nil {
 		return false, 0, errors.New("invalid payload")
