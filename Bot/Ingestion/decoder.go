@@ -475,33 +475,32 @@ func (d *Decoder) extractTopic0(rawLog []byte) (common.Hash, error) {
 	return common.HexToHash(string(topicHex)), nil
 }
 
-// extractTopic returns the nth topic (0‑indexed) as an address.
-func (d *Decoder) extractTopic(rawLog []byte, index int) (common.Address, error) {
+// extractTopic returns the nth topic (0‑indexed) as a common.Hash.
+func (d *Decoder) extractTopic(rawLog []byte, index int) (common.Hash, error) {
 	idx := bytes.Index(rawLog, []byte(`"topics":`))
 	if idx == -1 {
-		return common.Address{}, fmt.Errorf("topics field not found")
+		return common.Hash{}, fmt.Errorf("topics field not found")
 	}
 	idx += len(`"topics":`)
 	idx = skipWhitespace(rawLog, idx)
 	if idx >= len(rawLog) || rawLog[idx] != '[' {
-		return common.Address{}, fmt.Errorf("topics array start not found")
+		return common.Hash{}, fmt.Errorf("topics array start not found")
 	}
 	idx++ // skip '['
 
 	// Skip to the correct topic.
 	for i := 0; i < index; i++ {
-		// Find next comma or array end.
 		for idx < len(rawLog) && rawLog[idx] != ',' {
 			idx++
 		}
 		if idx >= len(rawLog) {
-			return common.Address{}, fmt.Errorf("topic %d not found", index)
+			return common.Hash{}, fmt.Errorf("topic %d not found", index)
 		}
 		idx++ // skip comma
 		idx = skipWhitespace(rawLog, idx)
 	}
 	if idx >= len(rawLog) || rawLog[idx] != '"' {
-		return common.Address{}, fmt.Errorf("topic %d not quoted", index)
+		return common.Hash{}, fmt.Errorf("topic %d not quoted", index)
 	}
 	idx++ // skip opening quote
 	start := idx
@@ -509,10 +508,14 @@ func (d *Decoder) extractTopic(rawLog []byte, index int) (common.Address, error)
 		idx++
 	}
 	if idx >= len(rawLog) {
-		return common.Address{}, fmt.Errorf("topic %d closing quote not found", index)
+		return common.Hash{}, fmt.Errorf("topic %d closing quote not found", index)
 	}
-	addrHex := rawLog[start:idx]
-	return common.HexToAddress(string(addrHex)), nil
+	topicHex := rawLog[start:idx]
+	var h common.Hash
+	if err := hexToHashBytes(topicHex, h[:]); err != nil {
+		return common.Hash{}, err
+	}
+	return h, nil
 }
 
 // extractAddress extracts the 'address' field from a log entry.
