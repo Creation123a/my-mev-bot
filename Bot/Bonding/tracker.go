@@ -16,7 +16,7 @@ import (
 	"github.com/ethereum/go-ethereum/accounts/abi"
 	"github.com/ethereum/go-ethereum/accounts/abi/bind"
 	"github.com/ethereum/go-ethereum/common"
-	"github.com/ethereum/go-ethereum/core/types"
+	gethTypes "github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/ethclient"
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/gorilla/websocket"
@@ -157,7 +157,7 @@ type Tracker struct {
 	wsClosed atomic.Bool
 
 	// Log processing (P1)
-	logChan chan types.Log
+	logChan chan gethTypes.Log
 }
 
 // NewTracker creates a new bonding tracker.
@@ -187,7 +187,7 @@ func NewTracker(
 		baseToken:       config.WETHAddress,
 		candidates:      make(map[common.Address]*BondingCandidate),
 		lastProcessedBlock: make(map[common.Address]uint64),
-		logChan:         make(chan types.Log, 256),
+		logChan:         make(chan gethTypes.Log, 256),
 	}
 	t.factoriesMu.Lock()
 	t.activeFactories = append(t.activeFactories, seedFactories...)
@@ -257,7 +257,7 @@ func (t *Tracker) fetchV3PoolState(ctx context.Context, pool common.Address) (sq
         return nil, 0, nil, fmt.Errorf("slot0 returned insufficient values")
     }
     sqrtPrice = out[0].(*big.Int)
-    tick = out[1].(int24)
+    tick = int32(out[1].(*big.Int).Int64())
 
     // Call liquidity
     var liqOut []interface{}
@@ -455,7 +455,7 @@ func (t *Tracker) runWebSocketSubscription(ctx context.Context) {
 				if err := json.Unmarshal(msg.Params, &subData); err != nil {
 					continue
 				}
-				var vLog types.Log
+				var vLog gethTypes.Log
 				if err := json.Unmarshal(subData.Result, &vLog); err != nil {
 					continue
 				}
@@ -482,7 +482,7 @@ func (t *Tracker) dialWebSocket(ctx context.Context) (*websocket.Conn, error) {
 	return conn, err
 }
 
-func (t *Tracker) handleWebSocketLog(vLog types.Log) {
+func (t *Tracker) handleWebSocketLog(vLog gethTypes.Log) {
 	if len(vLog.Topics) == 0 {
 		return
 	}
@@ -612,7 +612,7 @@ factories = append(factories, uniswapV3Factory)
 // ---- Core event handlers ----
 
 // handleNewTokenLog parses TokenDeployed or NewToken events.
-func (t *Tracker) handleNewTokenLog(vLog types.Log, factory common.Address) {
+func (t *Tracker) handleNewTokenLog(vLog gethTypes.Log, factory common.Address) {
     var tokenAddr common.Address
     var reserve, target *big.Int
     var pairAddr common.Address // for Clanker
@@ -694,7 +694,7 @@ func (t *Tracker) handleNewTokenLog(vLog types.Log, factory common.Address) {
     }
 }
 // handlePoolCreated processes a PoolCreated event and triggers the arbitrage.
-func (t *Tracker) handlePoolCreated(vLog types.Log) {
+func (t *Tracker) handlePoolCreated(vLog gethTypes.Log) {
     if len(vLog.Topics) < 4 {
         return
     }
