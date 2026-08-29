@@ -337,10 +337,9 @@ func (s *Sender) BroadcastRawTransactionBytes(rawTx []byte, payload *types.Execu
 			s.pendingMu.Lock()
 			defer s.pendingMu.Unlock()
 			// Check if we already have a pending tx with this nonce; if so, keep its hash.
-			if existing, ok := s.pending[nonce]; ok {
-				// Don't overwrite hash; keep the original.
-				return nil
-			}
+			if _, ok := s.pending[nonce]; ok {
+    return nil
+}
 			s.pending[nonce] = &PendingTx{
 				Nonce:   nonce,
 				Hash:    txHash,
