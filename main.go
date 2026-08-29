@@ -81,7 +81,7 @@ func init() {
 	}
 	executorABI = &parsed
 	arbitrageExecutedEvent = parsed.Events["ArbitrageExecuted"]
-	predictive.SetPayloadPool(payloadPool)
+	predictive.SetPayloadPool(&payloadPool)
 }
 
 func getPayload() *types.ExecutionPayload {
@@ -241,7 +241,7 @@ bondingFactories := []common.Address{
     common.HexToAddress("0x1A540088125d00dD3990f9dA45CA0859af4d3B01"), // Virtuals
 }
 allAddrs = append(allAddrs, bondingFactories...)
-allAddrs = append(allAddrs, cfg.BondingExecutorAddress)
+allAddrs = append(allAddrs, common.HexToAddress(cfg.BondingExecutorAddress))
 	stateCache.WarmUpAddresses(ethClient, allAddrs)
 
 	// ---- Create GEVMSimulator ----
