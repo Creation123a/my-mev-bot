@@ -258,7 +258,7 @@ func (d *DashboardServer) handleControl(w http.ResponseWriter, r *http.Request) 
     w.Write([]byte(`{"status":"ok"}`))
 }
 
-const htmlTemplate = <!DOCTYPE html>
+const htmlTemplate = `<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
@@ -371,4 +371,4 @@ document.getElementById("stopBtn").addEventListener("click", () => {
         };
     </script>
 </body>
-</html>
+</html>`
