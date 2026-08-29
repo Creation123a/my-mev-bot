@@ -1368,25 +1368,22 @@ func packLiquidationData(protocol uint8, args ...interface{}) []byte {
 			{Type: mustParseType("uint256"), Name: "minAmount"},
 		}
 	case ProtocolMorpho:
+    tupleType, err := abi.NewType("tuple", "", []abi.ArgumentMarshaling{
+        {Name: "loanToken", Type: "address"},
+        {Name: "collateralToken", Type: "address"},
+        {Name: "oracle", Type: "address"},
+        {Name: "irm", Type: "address"},
+        {Name: "lltv", Type: "uint256"},
+    })
+    if err != nil {
+        log.Printf("[Liquidation] Failed to create tuple type: %v", err)
+        return nil
+    }
     arguments = abi.Arguments{
-        // Define the tuple type with components using NewType
-tupleType, err := abi.NewType("tuple", "", []abi.ArgumentMarshaling{
-    {Name: "loanToken", Type: "address"},
-    {Name: "collateralToken", Type: "address"},
-    {Name: "oracle", Type: "address"},
-    {Name: "irm", Type: "address"},
-    {Name: "lltv", Type: "uint256"},
-})
-if err != nil {
-    log.Printf("Failed to create tuple type: %v", err)
-    return nil
-}
-arguments = abi.Arguments{
-    {Type: tupleType, Name: "params"},
-    {Type: mustParseType("address"), Name: "borrower"},
-    {Type: mustParseType("uint256"), Name: "seizedAssets"},
-    {Type: mustParseType("uint256"), Name: "maxRepay"},
-}
+        {Type: tupleType, Name: "params"},
+        {Type: mustParseType("address"), Name: "borrower"},
+        {Type: mustParseType("uint256"), Name: "seizedAssets"},
+        {Type: mustParseType("uint256"), Name: "maxRepay"},
     }
 	case ProtocolExactly:
 		arguments = abi.Arguments{
