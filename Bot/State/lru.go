@@ -100,8 +100,7 @@ func (c *LRUCache) Put(token common.Address) {
 	defer c.mu.Unlock()
 
 	n := len(c.slots)
-	addr := token
-
+	
 	// 1. Check if token already exists.
 	for i := 0; i < n; i++ {
 		ent := &c.slots[i]
