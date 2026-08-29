@@ -911,7 +911,10 @@ if cand == nil || cand.Graduating {
 	}
 
 	// Build calldata using the snapshot values
-	calldata, err := buildFlashLoanCalldata(
+	var calldata []byte
+var err error
+
+	calldata, err = buildFlashLoanCalldata(
 		factory,
 		tokenAddr,
 		t.baseToken,
