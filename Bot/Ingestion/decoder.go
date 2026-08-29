@@ -7,7 +7,9 @@ import (
 	"math/big"
 	"strconv"
 	"time"
+	"unsafe"
 
+	"github.com/buger/jsonparser"
 	"github.com/ethereum/go-ethereum/common"
 
 	"my-mev-bot/Bot/Types"
@@ -18,53 +20,314 @@ import (
 // =============================================================================
 
 var (
-	// UniswapV2SwapTopic is the event signature for Swap(address,uint256,uint256,uint256,uint256,address)
-	// Used by Uniswap V2, Aerodrome V2, AlienBase V2, etc.
 	UniswapV2SwapTopic = common.HexToHash("0xd78ad95fa46c994b6551d0da85fc275fe613ce37657fb8d5e3d130840159d822")
-
-	// UniswapV3SwapTopic is the event signature for Swap(address,address,int256,int256,uint160,uint128,int24)
-	// Used by Uniswap V3 and PancakeSwap V3.
-	// Correct topic hash (verified against official Uniswap V3 source)
 	UniswapV3SwapTopic = common.HexToHash("0xc42079f94a6350d7e6235f29174924f928cc2ac818eb64fed8004e115fbcca67")
-
-	// tt256 = 2^256 (used for two's complement conversion of negative int256)
-	tt256 = new(big.Int).Lsh(big.NewInt(1), 256)
+	tt256              = new(big.Int).Lsh(big.NewInt(1), 256)
 )
 
 // =============================================================================
-// Decoder state – zero-allocation parser with reusable big.Int fields
+// Decoder state – reusable big.Int fields for zero‑allocation amount parsing
 // =============================================================================
 
-// Decoder parses raw Flashblock log events. It contains mutable parsing state
-// and must be used by a single goroutine at a time. Concurrent calls to
-// ParseSwapLog on the same instance are unsupported.
 type Decoder struct {
-	scratch [64]byte // reusable scratch space for hex parsing (enough for 32-byte words)
+	scratch [64]byte
 
-	// Reusable big.Int fields for V2 swap parsing (avoid allocations in hot path)
 	amount0In  big.Int
 	amount1In  big.Int
 	amount0Out big.Int
 	amount1Out big.Int
 
-	// Reusable big.Int fields for V3 swap parsing
-	amount0 big.Int
-	amount1 big.Int
-	tmpSqrt big.Int
-	tmpLiq  big.Int
+	amount0  big.Int
+	amount1  big.Int
+	tmpSqrt  big.Int
+	tmpLiq   big.Int
 }
 
-// NewDecoder creates a new decoder.
 func NewDecoder() *Decoder {
 	return &Decoder{}
 }
 
 // =============================================================================
-// Main parsing function
+// Zero‑allocation JSON parser using jsonparser + unsafe
 // =============================================================================
 
-// ParseSwapLog parses a raw Flashblock log event into the provided SwapLog struct.
-// It mutates outLog directly to avoid heap allocations. Returns nil on success.
+// FastString converts a byte slice to a string with zero allocations.
+// WARNING: The string is valid only as long as the underlying byte buffer is alive.
+func FastString(b []byte) string {
+	if len(b) == 0 {
+		return ""
+	}
+	return *(*string)(unsafe.Pointer(&b))
+}
+
+// hexToAddressBytes decodes 0x‑prefixed hex into a 20‑byte slice with bounds checks.
+func hexToAddressBytes(hex []byte, dest []byte) error {
+	if len(hex) < 42 || hex[0] != '0' || (hex[1] != 'x' && hex[1] != 'X') {
+		return fmt.Errorf("invalid hex address")
+	}
+	src := hex[2:]
+	if len(src) != 40 {
+		return fmt.Errorf("address length must be 40 hex chars")
+	}
+	for i := 0; i < 20; i++ {
+		high := fromHexChar(src[i*2])
+		low := fromHexChar(src[i*2+1])
+		if high == 0xff || low == 0xff {
+			return fmt.Errorf("invalid hex char")
+		}
+		dest[i] = (high << 4) | low
+	}
+	return nil
+}
+
+// hexToHashBytes decodes 0x‑prefixed hex into a 32‑byte slice with bounds checks.
+func hexToHashBytes(hex []byte, dest []byte) error {
+	if len(hex) < 66 || hex[0] != '0' || (hex[1] != 'x' && hex[1] != 'X') {
+		return fmt.Errorf("invalid hex hash")
+	}
+	src := hex[2:]
+	if len(src) != 64 {
+		return fmt.Errorf("hash length must be 64 hex chars")
+	}
+	for i := 0; i < 32; i++ {
+		high := fromHexChar(src[i*2])
+		low := fromHexChar(src[i*2+1])
+		if high == 0xff || low == 0xff {
+			return fmt.Errorf("invalid hex char")
+		}
+		dest[i] = (high << 4) | low
+	}
+	return nil
+}
+
+func fromHexChar(c byte) byte {
+	if c >= '0' && c <= '9' {
+		return c - '0'
+	}
+	if c >= 'a' && c <= 'f' {
+		return c - 'a' + 10
+	}
+	if c >= 'A' && c <= 'F' {
+		return c - 'A' + 10
+	}
+	return 0xff
+}
+
+// parseSwapLogZeroAlloc fills a SwapLog from raw JSON log data using jsonparser.
+// It reuses the Decoder's hex decoding methods and big.Int fields.
+func parseSwapLogZeroAlloc(data []byte, out *types.SwapLog, decoder *Decoder) error {
+	if len(data) < 10 {
+		return fmt.Errorf("log data too short")
+	}
+	out.Reset()
+	out.Timestamp = time.Now()
+
+	// --- address ---
+	addrBytes, _, _, err := jsonparser.Get(data, "address")
+	if err != nil || len(addrBytes) < 42 {
+		return fmt.Errorf("address missing or invalid")
+	}
+	if err := hexToAddressBytes(addrBytes, out.Address[:]); err != nil {
+		return err
+	}
+
+	// --- blockNumber ---
+	blockNum, err := jsonparser.GetInt(data, "blockNumber")
+	if err != nil {
+		return err
+	}
+	out.BlockNumber = uint64(blockNum)
+
+	// --- transactionHash ---
+	txHashBytes, _, _, err := jsonparser.Get(data, "transactionHash")
+	if err != nil || len(txHashBytes) < 66 {
+		return fmt.Errorf("txHash missing")
+	}
+	if err := hexToHashBytes(txHashBytes, out.TxHash[:]); err != nil {
+		return err
+	}
+
+	// --- transactionIndex (optional) ---
+	if txIndex, err := jsonparser.GetInt(data, "transactionIndex"); err == nil {
+		out.TxIndex = uint(txIndex)
+	}
+
+	// --- topics (array) ---
+	var topics [4]common.Hash
+	topicCount := 0
+	_, err = jsonparser.ArrayEach(data, func(value []byte, dataType jsonparser.ValueType, offset int, err error) {
+		if topicCount >= 4 || err != nil {
+			return
+		}
+		if len(value) < 66 {
+			err = fmt.Errorf("topic too short")
+			return
+		}
+		var h common.Hash
+		if e := hexToHashBytes(value, h[:]); e != nil {
+			err = e
+			return
+		}
+		topics[topicCount] = h
+		topicCount++
+	}, "topics")
+	if err != nil {
+		return err
+	}
+	// Reuse backing array of out.Topics to avoid allocation
+	out.Topics = out.Topics[:0]
+	out.Topics = append(out.Topics, topics[:topicCount]...)
+
+	if topicCount == 0 {
+		return fmt.Errorf("no topics found")
+	}
+
+	// --- data (hex string) ---
+	dataHex, _, _, err := jsonparser.Get(data, "data")
+	if err != nil || len(dataHex) < 2 {
+		return fmt.Errorf("data missing")
+	}
+	// Remove 0x prefix if present.
+	if len(dataHex) >= 2 && dataHex[0] == '0' && (dataHex[1] == 'x' || dataHex[1] == 'X') {
+		dataHex = dataHex[2:]
+	}
+
+	// Determine event type from topic0.
+	topic0 := topics[0]
+	if bytes.Equal(topic0.Bytes(), UniswapV2SwapTopic.Bytes()) {
+		return decoder.decodeV2SwapFromData(dataHex, out)
+	}
+	if bytes.Equal(topic0.Bytes(), UniswapV3SwapTopic.Bytes()) {
+		return decoder.decodeV3SwapFromData(dataHex, out)
+	}
+	return fmt.Errorf("unknown event signature: %x", topic0)
+}
+
+// =============================================================================
+// Internal decoders that work directly on hex data (no JSON scanning)
+// =============================================================================
+
+// decodeV2SwapFromData decodes V2 amounts from the data hex string.
+func (d *Decoder) decodeV2SwapFromData(dataHex []byte, out *types.SwapLog) error {
+	if len(dataHex) < 256 {
+		return fmt.Errorf("V2 data hex too short (need 256 chars, got %d)", len(dataHex))
+	}
+	// Decode amounts directly into d.* fields.
+	if err := d.hexToBytes(d.scratch[:32], dataHex[0:64]); err != nil {
+		return err
+	}
+	d.amount0In.SetBytes(d.scratch[:32])
+	if err := d.hexToBytes(d.scratch[:32], dataHex[64:128]); err != nil {
+		return err
+	}
+	d.amount1In.SetBytes(d.scratch[:32])
+	if err := d.hexToBytes(d.scratch[:32], dataHex[128:192]); err != nil {
+		return err
+	}
+	d.amount0Out.SetBytes(d.scratch[:32])
+	if err := d.hexToBytes(d.scratch[:32], dataHex[192:256]); err != nil {
+		return err
+	}
+	d.amount1Out.SetBytes(d.scratch[:32])
+
+	// Determine direction.
+	if d.amount0In.Sign() > 0 && d.amount1Out.Sign() > 0 {
+		out.AmountIn.Set(&d.amount0In)
+		out.AmountOut.Set(&d.amount1Out)
+	} else if d.amount1In.Sign() > 0 && d.amount0Out.Sign() > 0 {
+		out.AmountIn.Set(&d.amount1In)
+		out.AmountOut.Set(&d.amount0Out)
+	} else {
+		return fmt.Errorf("no valid V2 swap amounts")
+	}
+	out.AmountInFloat = float64FromBig(out.AmountIn)
+	out.AmountOutFloat = float64FromBig(out.AmountOut)
+	return nil
+}
+
+// decodeV3SwapFromData decodes V3 amounts and state from the data hex string.
+func (d *Decoder) decodeV3SwapFromData(dataHex []byte, out *types.SwapLog) error {
+	if len(dataHex) < 320 {
+		return fmt.Errorf("V3 data hex too short (need 320 chars, got %d)", len(dataHex))
+	}
+	// amount0 (signed)
+	if err := d.hexToBytes(d.scratch[:32], dataHex[0:64]); err != nil {
+		return err
+	}
+	d.amount0.SetBytes(d.scratch[:32])
+	if isNegativeHex(dataHex[0]) {
+		d.amount0.Sub(&d.amount0, tt256)
+	}
+	// amount1 (signed)
+	if err := d.hexToBytes(d.scratch[:32], dataHex[64:128]); err != nil {
+		return err
+	}
+	d.amount1.SetBytes(d.scratch[:32])
+	if isNegativeHex(dataHex[64]) {
+		d.amount1.Sub(&d.amount1, tt256)
+	}
+	// sqrtPriceX96
+	if err := d.hexToBytes(d.scratch[:32], dataHex[128:192]); err != nil {
+		return err
+	}
+	d.tmpSqrt.SetBytes(d.scratch[:32])
+	out.SqrtPriceX96.Set(&d.tmpSqrt)
+	out.SqrtPriceX96Float = float64FromBig(out.SqrtPriceX96)
+	// liquidity
+	if err := d.hexToBytes(d.scratch[:32], dataHex[192:256]); err != nil {
+		return err
+	}
+	d.tmpLiq.SetBytes(d.scratch[:32])
+	out.Liquidity.Set(&d.tmpLiq)
+	out.LiquidityFloat = float64FromBig(out.Liquidity)
+	// tick (int24)
+	if err := d.hexToBytes(d.scratch[:32], dataHex[256:320]); err != nil {
+		return err
+	}
+	b := d.scratch[:32]
+	tickVal := int32(b[29])<<16 | int32(b[30])<<8 | int32(b[31])
+	if tickVal&0x800000 != 0 {
+		tickVal -= 0x1000000
+	}
+	out.Tick = tickVal
+
+	// Determine input/output direction.
+	if d.amount0.Sign() > 0 && d.amount1.Sign() < 0 {
+		out.AmountIn.Set(&d.amount0)
+		d.amount1.Neg(&d.amount1)
+		out.AmountOut.Set(&d.amount1)
+	} else if d.amount1.Sign() > 0 && d.amount0.Sign() < 0 {
+		out.AmountIn.Set(&d.amount1)
+		d.amount0.Neg(&d.amount0)
+		out.AmountOut.Set(&d.amount0)
+	} else {
+		return fmt.Errorf("ambiguous V3 swap amounts")
+	}
+	out.AmountInFloat = float64FromBig(out.AmountIn)
+	out.AmountOutFloat = float64FromBig(out.AmountOut)
+	return nil
+}
+
+// isNegativeHex returns true if the first hex character indicates a negative signed value.
+func isNegativeHex(c byte) bool {
+	return (c >= '8' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')
+}
+
+// float64FromBig converts a big.Int to float64 (approximation).
+func float64FromBig(v *big.Int) float64 {
+	if v == nil {
+		return 0
+	}
+	f, _ := new(big.Float).SetInt(v).Float64()
+	return f
+}
+
+// =============================================================================
+// Legacy parser – kept for compatibility (uses manual scanning)
+// =============================================================================
+
+// ParseSwapLog parses a raw Flashblock log event using manual scanning.
+// It is a fallback for code that does not use the zero‑alloc path.
 func (d *Decoder) ParseSwapLog(rawLog []byte, outLog *types.SwapLog) error {
 	outLog.Reset()
 
@@ -83,10 +346,11 @@ func (d *Decoder) ParseSwapLog(rawLog []byte, outLog *types.SwapLog) error {
 }
 
 // =============================================================================
-// V2 Swap Decoder
+// Legacy V2 decoder – uses manual extraction and then reuses the hex decoder
 // =============================================================================
 
 func (d *Decoder) decodeV2Swap(rawLog []byte, outLog *types.SwapLog) error {
+	// Extract address, txHash, blockNumber, txIndex
 	pool, err := d.extractAddress(rawLog)
 	if err != nil {
 		return err
@@ -105,87 +369,37 @@ func (d *Decoder) decodeV2Swap(rawLog []byte, outLog *types.SwapLog) error {
 	}
 	outLog.BlockNumber = blockNum
 
-	// Set timestamp to receive time (for latency tracking).
-	outLog.Timestamp = time.Now()
-
-	// Extract transaction index if present.
 	if txIndex, err := d.extractTxIndex(rawLog); err == nil {
 		outLog.TxIndex = uint(txIndex)
-	} else {
-		outLog.TxIndex = 0
 	}
 
-	// For V2, topics[1] and [2] are sender/recipient wallet addresses – NOT token addresses.
-	// We will infer TokenIn/TokenOut from the amounts below.
-	outLog.TokenIn = common.Address{}
-	outLog.TokenOut = common.Address{}
-
-	// Decode amounts directly into the reusable big.Int fields.
-	if err := d.extractV2Amounts(rawLog); err != nil {
-		return err
+	// Extract topics (at least topic0)
+	// We'll extract topics[1] and [2] if present to preserve original behavior.
+	// For V2, topics[1] and [2] are sender/recipient, but we don't need them.
+	// We only need to set outLog.Topics for compatibility.
+	var topics [4]common.Hash
+	topics[0] = UniswapV2SwapTopic
+	// Try to extract topic1 and topic2
+	if t1, err := d.extractTopic(rawLog, 1); err == nil {
+		topics[1] = t1
 	}
-
-	// Determine which side is in/out and assign to outLog.
-	// The event structure: amount0In, amount1In, amount0Out, amount1Out.
-	// In a typical pool, either amount0In and amount1Out are positive (swap token0 -> token1)
-	// or amount1In and amount0Out are positive (swap token1 -> token0).
-	if d.amount0In.Sign() > 0 && d.amount1Out.Sign() > 0 {
-		// token0 is input, token1 is output.
-		outLog.AmountIn.Set(&d.amount0In)
-		outLog.AmountOut.Set(&d.amount1Out)
-		// Note: we cannot set TokenIn/TokenOut until we know the pool's token order.
-		// We'll leave them zero and let matrix infer from pool state.
-	} else if d.amount1In.Sign() > 0 && d.amount0Out.Sign() > 0 {
-		outLog.AmountIn.Set(&d.amount1In)
-		outLog.AmountOut.Set(&d.amount0Out)
-	} else {
-		return fmt.Errorf("no valid input/output amounts in V2 swap")
+	if t2, err := d.extractTopic(rawLog, 2); err == nil {
+		topics[2] = t2
 	}
-	outLog.AmountInFloat = float64FromBig(outLog.AmountIn)
-	outLog.AmountOutFloat = float64FromBig(outLog.AmountOut)
-	return nil
-}
+	outLog.Topics = outLog.Topics[:0]
+	outLog.Topics = append(outLog.Topics, topics[:3]...)
 
-// extractV2Amounts decodes the four amount fields from the data field into the decoder's
-// reusable big.Int fields.
-func (d *Decoder) extractV2Amounts(rawLog []byte) error {
-	data, err := d.extractData(rawLog)
+	// Extract data hex and delegate to the new decoder.
+	dataHex, err := d.extractData(rawLog)
 	if err != nil {
 		return err
 	}
-	if len(data) < 256 {
-		return fmt.Errorf("data hex too short for V2 swap")
-	}
-
-	// amount0In
-	if err := d.hexToBytes(d.scratch[:32], data[0:64]); err != nil {
-		return err
-	}
-	d.amount0In.SetBytes(d.scratch[:32])
-
-	// amount1In
-	if err := d.hexToBytes(d.scratch[:32], data[64:128]); err != nil {
-		return err
-	}
-	d.amount1In.SetBytes(d.scratch[:32])
-
-	// amount0Out
-	if err := d.hexToBytes(d.scratch[:32], data[128:192]); err != nil {
-		return err
-	}
-	d.amount0Out.SetBytes(d.scratch[:32])
-
-	// amount1Out
-	if err := d.hexToBytes(d.scratch[:32], data[192:256]); err != nil {
-		return err
-	}
-	d.amount1Out.SetBytes(d.scratch[:32])
-
-	return nil
+	// dataHex already has 0x prefix removed by extractData.
+	return d.decodeV2SwapFromData(dataHex, outLog)
 }
 
 // =============================================================================
-// V3 Swap Decoder
+// Legacy V3 decoder – similar to V2
 // =============================================================================
 
 func (d *Decoder) decodeV3Swap(rawLog []byte, outLog *types.SwapLog) error {
@@ -207,128 +421,26 @@ func (d *Decoder) decodeV3Swap(rawLog []byte, outLog *types.SwapLog) error {
 	}
 	outLog.BlockNumber = blockNum
 
-	// Set timestamp to receive time.
-	outLog.Timestamp = time.Now()
-
-	// Extract transaction index if present.
 	if txIndex, err := d.extractTxIndex(rawLog); err == nil {
 		outLog.TxIndex = uint(txIndex)
-	} else {
-		outLog.TxIndex = 0
 	}
 
-	// For V3, topics[1] and [2] are sender/recipient wallet addresses – NOT token addresses.
-	// We'll set TokenIn/TokenOut based on the sign of amount0/amount1 after decoding.
-	// But we need the pool's token order; we can't know it here without an RPC.
-	// We'll leave them zero and let matrix infer from the price change, which is more reliable.
-	outLog.TokenIn = common.Address{}
-	outLog.TokenOut = common.Address{}
-
-	// Decode amounts (int256) and V3 state (sqrtPriceX96, liquidity, tick).
-	if err := d.extractV3State(rawLog, outLog); err != nil {
-		return err
+	var topics [4]common.Hash
+	topics[0] = UniswapV3SwapTopic
+	if t1, err := d.extractTopic(rawLog, 1); err == nil {
+		topics[1] = t1
 	}
-
-	// Determine which side is in/out based on the sign of amount0 and amount1.
-	// In Uniswap V3, exactly one of amount0, amount1 is positive (input) and the other negative (output).
-	if d.amount0.Sign() > 0 && d.amount1.Sign() < 0 {
-		// token0 is input, token1 is output.
-		outLog.AmountIn.Set(&d.amount0)
-		d.amount1.Neg(&d.amount1) // make positive
-		outLog.AmountOut.Set(&d.amount1)
-	} else if d.amount1.Sign() > 0 && d.amount0.Sign() < 0 {
-		// token1 is input, token0 is output.
-		outLog.AmountIn.Set(&d.amount1)
-		d.amount0.Neg(&d.amount0)
-		outLog.AmountOut.Set(&d.amount0)
-	} else {
-		// A valid V3 swap always has exactly one positive and one negative amount.
-		// Reject the event; the old fallback would guess incorrectly.
-		return fmt.Errorf("ambiguous V3 swap amounts: amount0 sign %d, amount1 sign %d",
-			d.amount0.Sign(), d.amount1.Sign())
+	if t2, err := d.extractTopic(rawLog, 2); err == nil {
+		topics[2] = t2
 	}
-	outLog.AmountInFloat = float64FromBig(outLog.AmountIn)
-	outLog.AmountOutFloat = float64FromBig(outLog.AmountOut)
-	return nil
-}
+	outLog.Topics = outLog.Topics[:0]
+	outLog.Topics = append(outLog.Topics, topics[:3]...)
 
-// extractV3State decodes amount0, amount1, sqrtPriceX96, liquidity, and tick
-// from the V3 swap event data into the decoder's fields and outLog.
-func (d *Decoder) extractV3State(rawLog []byte, outLog *types.SwapLog) error {
-	data, err := d.extractData(rawLog)
+	dataHex, err := d.extractData(rawLog)
 	if err != nil {
 		return err
 	}
-	// Minimum length: amount0 (32 bytes) + amount1 (32) + sqrtPriceX96 (32) + liquidity (32) + tick (32) = 160 bytes = 320 hex chars
-	if len(data) < 320 {
-		return fmt.Errorf("V3 data too short (expected >=320 hex chars, got %d)", len(data))
-	}
-
-	// amount0 (signed 256-bit) at offset 0
-	if err := d.hexToBytes(d.scratch[:32], data[0:64]); err != nil {
-		return err
-	}
-	d.amount0.SetBytes(d.scratch[:32])
-	if isNegativeHex(data[0]) {
-		d.amount0.Sub(&d.amount0, tt256)
-	}
-
-	// amount1 (signed 256-bit) at offset 64
-	if err := d.hexToBytes(d.scratch[:32], data[64:128]); err != nil {
-		return err
-	}
-	d.amount1.SetBytes(d.scratch[:32])
-	if isNegativeHex(data[64]) {
-		d.amount1.Sub(&d.amount1, tt256)
-	}
-
-	// sqrtPriceX96 (uint160) at offset 128 – decode as 32-byte word (padded)
-	if err := d.hexToBytes(d.scratch[:32], data[128:192]); err != nil {
-		return err
-	}
-	d.tmpSqrt.SetBytes(d.scratch[:32])
-	outLog.SqrtPriceX96.Set(&d.tmpSqrt)
-	outLog.SqrtPriceX96Float = float64FromBig(outLog.SqrtPriceX96)
-
-	// liquidity (uint128) at offset 192 – decode as 32-byte word
-	if err := d.hexToBytes(d.scratch[:32], data[192:256]); err != nil {
-		return err
-	}
-	d.tmpLiq.SetBytes(d.scratch[:32])
-	outLog.Liquidity.Set(&d.tmpLiq)
-	outLog.LiquidityFloat = float64FromBig(outLog.Liquidity)
-
-	// tick (int24) at offset 256 – decode the full 32-byte word, extract last 3 bytes, sign-extend to int32
-	if err := d.hexToBytes(d.scratch[:32], data[256:320]); err != nil {
-		return err
-	}
-	// The tick is stored in the last 3 bytes (bytes 29-31) of the 32-byte word
-	var tickVal int32
-	b := d.scratch[:32]
-	tickVal = int32(b[29])<<16 | int32(b[30])<<8 | int32(b[31])
-	// Sign extend if the 24-bit value is negative (bit 23 set)
-	if tickVal&0x800000 != 0 {
-		// Use subtraction to avoid int32 overflow (0xFF000000 is not representable in int32).
-		tickVal -= 0x1000000
-	}
-	outLog.Tick = tickVal
-
-	return nil
-}
-
-// isNegativeHex returns true if the first hex character (nibble) indicates that the
-// most significant bit (bit 255 of a 32‑byte word) is set (i.e., the hex digit is >= 8).
-func isNegativeHex(c byte) bool {
-	return (c >= '8' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')
-}
-
-// float64FromBig converts a big.Int to float64 (approximation, zero‑allocation).
-func float64FromBig(v *big.Int) float64 {
-	if v == nil {
-		return 0
-	}
-	f, _ := new(big.Float).SetInt(v).Float64()
-	return f
+	return d.decodeV3SwapFromData(dataHex, outLog)
 }
 
 // =============================================================================
