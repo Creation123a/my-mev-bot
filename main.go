@@ -9,27 +9,33 @@ import (
 	"os"
 	"os/signal"
 	"runtime"
+	"runtime/debug"
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
+	"github.com/ethereum/go-ethereum"
+	"github.com/ethereum/go-ethereum/accounts/abi"
 	"github.com/ethereum/go-ethereum/common"
 	gethTypes "github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/ethclient"
 	"golang.org/x/sys/unix"
-
-
+	
+	"my-mev-bot/Bot/Bonding"
 	"my-mev-bot/Bot/Config"
 	"my-mev-bot/Bot/Dashboard"
 	"my-mev-bot/Bot/Execution"
+	"my-mev-bot/Bot/Gatekeeper"
 	"my-mev-bot/Bot/Ingestion"
+	"my-mev-bot/Bot/Predictive"
 	"my-mev-bot/Bot/Solver"
 	"my-mev-bot/Bot/State"
 	"my-mev-bot/Bot/Types"
-	"my-mev-bot/Bot/Gatekeeper"
+	"my-mev-bot/Bot/Liquidation"
 )
 
 const (
@@ -42,18 +48,18 @@ const (
 )
 
 var (
-	dashServer *dashboard.DashboardServer
+	dashServer   *dashboard.DashboardServer
+	profitMu     sync.Mutex
+	totalProfit  float64
+	lastLogMu    sync.Mutex
+	lastSwapLog  *types.SwapLog
+	activeTrades uint32 // used by memoryGuardian (kept for compatibility, but GC removed)
 )
-
-var (
-	profitMu    sync.Mutex
-	totalProfit float64
-)
-
-var (
-	lastLogMu  sync.Mutex
-	lastSwapLog *types.SwapLog
-)
+type blockInfo struct {
+    Number uint64
+    Hash   common.Hash
+}
+var latestBlock atomic.Value // stores *blockInfo
 
 // Global price cache used only in the fallback path of worker2.
 var globalPriceCache sync.Map
@@ -62,6 +68,20 @@ var payloadPool = sync.Pool{
 	New: func() interface{} {
 		return &types.ExecutionPayload{}
 	},
+}
+
+// Event signature for ArbitrageExecuted
+var arbitrageExecutedEvent abi.Event
+var executorABI *abi.ABI
+
+func init() {
+	parsed, err := abi.JSON(strings.NewReader(`[{"anonymous":false,"inputs":[{"indexed":true,"name":"loanToken","type":"address"},{"indexed":false,"name":"loanAmount","type":"uint256"},{"indexed":false,"name":"profit","type":"uint256"},{"indexed":false,"name":"minProfit","type":"uint256"},{"indexed":false,"name":"success","type":"bool"}],"name":"ArbitrageExecuted","type":"event"}]`))
+	if err != nil {
+		panic(err)
+	}
+	executorABI = &parsed
+	arbitrageExecutedEvent = parsed.Events["ArbitrageExecuted"]
+	predictive.SetPayloadPool(payloadPool)
 }
 
 func getPayload() *types.ExecutionPayload {
@@ -86,6 +106,13 @@ func pinToCore(core int) {
 }
 
 func main() {
+	// ===== 1. Set incremental GC (removes STW pauses) =====
+	debug.SetGCPercent(50)
+
+	// ===== 2. Lock main thread to prevent migration =====
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+
 	cfg, err := config.LoadConfig()
 	if err != nil {
 		log.Fatalf("Failed to load config: %v", err)
@@ -97,6 +124,7 @@ func main() {
 
 	dashServer = dashboard.NewDashboardServer()
 	go func() {
+		defer recoverPanic("Dashboard server")
 		if err := dashServer.Start(":8080"); err != nil {
 			log.Printf("Dashboard server error: %v", err)
 		}
@@ -130,22 +158,96 @@ func main() {
 	if err != nil {
 		log.Fatalf("Failed to create eth client: %v", err)
 	}
-	nonceTracker := state.NewNonceTracker()
-	if err := nonceTracker.SyncFromNode(ethClient, ownerAddress); err != nil {
-		log.Fatalf("Failed to sync nonce from node: %v", err)
+nonceTracker := state.NewNonceTracker()
+if err := nonceTracker.SyncFromNode(ethClient, ownerAddress); err != nil {
+    log.Fatalf("Failed to sync nonce from node: %v", err)
+}
+
+
+	if err := solver.FetchCurrentFees(ethClient); err != nil {
+		log.Printf("Warning: failed to fetch initial fees: %v", err)
 	}
-
 	matrix.SetEthClient(ethClient)
-ctx, cancel := context.WithCancel(context.Background())
-defer cancel()
-// ================================================================
 
-	// ---- Create GEVMSimulator with WebSocket URL ----
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+// ---- Periodic nonce refresh ----
+go func() {
+    ticker := time.NewTicker(30 * time.Second)
+    defer ticker.Stop()
+    for {
+        select {
+        case <-ctx.Done():
+            return
+        case <-ticker.C:
+            if err := nonceTracker.SyncFromNode(ethClient, ownerAddress); err != nil {
+                log.Printf("[Nonce] Sync failed: %v", err)
+            }
+        }
+    }
+}()
+	// ---- Predictive Flashblock PLL ----
+	pll := predictive.NewFlashblockPLL()
+	wsClient, err := ethclient.Dial(cfg.BaseWSRPC)
+	if err != nil {
+		log.Fatalf("Failed to create WebSocket client for PLL: %v", err)
+	}
+	defer wsClient.Close()
+
+go func() {
+    defer recoverPanic("PLL subscriber")
+    headers := make(chan *gethTypes.Header, 10)
+    sub, err := wsClient.SubscribeNewHead(ctx, headers)
+    if err != nil {
+        log.Printf("[PLL] Failed to subscribe to new heads: %v", err)
+        return
+    }
+    defer sub.Unsubscribe()
+    for {
+        select {
+        case <-ctx.Done():
+            return
+        case err := <-sub.Err():
+            log.Printf("[PLL] Subscription error: %v", err)
+            return
+        case head := <-headers:
+            pll.RecordBlockTick(time.Now())
+            // Cache the latest block info (atomic store)
+            latestBlock.Store(&blockInfo{
+                Number: head.Number.Uint64(),
+                Hash:   head.Hash(),
+            })
+        }
+    }
+}()
+	// ===== 3. Create StateCache and warm it up =====
+	stateCache := execution.NewStateCache()
+
+	loanProviders := []common.Address{config.BalancerVault}
+	if cfg.DODOPoolAddress != "" {
+		dodoAddr := common.HexToAddress(cfg.DODOPoolAddress)
+		if dodoAddr != (common.Address{}) {
+			loanProviders = append(loanProviders, dodoAddr)
+		}
+	}
+	
+	allAddrs := append(loanProviders, anchors[:]...)
+	for _, pool := range matrix.GetPools() {
+		allAddrs = append(allAddrs, pool.Token0, pool.Token1)
+	}
+	// In main.go, after loanProviders and before WarmUpAddresses:
+bondingFactories := []common.Address{
+    common.HexToAddress("0xe85a59c628f7d27878aceb4bf3b35733630083a9"), // Clanker V4
+    common.HexToAddress("0x1A540088125d00dD3990f9dA45CA0859af4d3B01"), // Virtuals
+}
+allAddrs = append(allAddrs, bondingFactories...)
+allAddrs = append(allAddrs, cfg.BondingExecutorAddress)
+	stateCache.WarmUpAddresses(ethClient, allAddrs)
+
+	// ---- Create GEVMSimulator ----
 	gevm := execution.NewGEVMSimulator(cfg.BaseHTTPRPC, cfg.BaseWSRPC, ownerAddress)
-
 	gevm.SetMatrix(matrix)
 
-	stateCache := execution.NewStateCache()
 	executorCode, err := ethClient.CodeAt(ctx, cfg.ExecutorAddress, nil)
 	if err != nil {
 		log.Printf("Warning: failed to fetch executor code: %v; local EVM may not work.", err)
@@ -162,28 +264,26 @@ defer cancel()
 		stateCache.SetCode(pool.PoolAddress, code)
 	}
 	gevm.SetStateCache(stateCache)
-	// Create the three LRU caches
-memeCache := lru // lru is already created as state.NewMemeTokenCache()
-dexCache := state.NewDEXFactoryCache()
-pairCache := state.NewBasePairCache()
-// Create the gatekeeper with background qualification workers
-gatekeeper := gatekeeper.New(
-    ethClient,
-    gevm,
-    memeCache, // same as lru
-    dexCache,
-    pairCache,
-    blacklist,
-    matrix,
-)
 
+	memeCache := lru
+	dexCache := state.NewDEXFactoryCache()
+	pairCache := state.NewBasePairCache()
 
-	// ---- Start WebSocket‑based block context updater ----
+	gatekeeper := gatekeeper.New(
+		ethClient,
+		gevm,
+		memeCache,
+		dexCache,
+		pairCache,
+		blacklist,
+		matrix,
+		ownerAddress,
+	)
+
 	gevm.StartWebSocketContextUpdater(ctx)
 
-	// ---- Removed Anvil health checks and background ticker ----
-
-	sender, err := execution.NewSender(cfg.BaseHTTPRPC, cfg.PrivateKey)
+	// ---- Sender ----
+	sender, err := execution.NewSender(cfg.BaseExecRPC, cfg.PrivateKey)
 	if err != nil {
 		log.Fatalf("Failed to initialize sender: %v", err)
 	}
@@ -193,20 +293,67 @@ gatekeeper := gatekeeper.New(
 		float64(100+cfg.ReplaceBumpPercent)/100.0,
 		cfg.MaxReplaceAttempts,
 	)
+	sender.SetEthPrice(solver.GetEthPrice())
+	sender.SetReleasePayloadFunc(putPayload)
+
+	// Nonce rollback callback
+	sender.SetRollbackNonceFunc(func() {
+		nonceTracker.Rollback()
+	})
 
 	sender.SetConfirmationCallback(func(nonce uint64, txHash common.Hash, receipt *gethTypes.Receipt, payload *types.ExecutionPayload) {
-		profitUSD := payload.MinProfitUSD
+		defer func() {
+			if payload != nil {
+				putPayload(payload)
+			}
+		}()
+		var profitWei *big.Int
+		for _, vLog := range receipt.Logs {
+			if vLog.Address == cfg.ExecutorAddress && len(vLog.Topics) > 0 && vLog.Topics[0] == arbitrageExecutedEvent.ID {
+				var event struct {
+					LoanToken  common.Address
+					LoanAmount *big.Int
+					Profit     *big.Int
+					MinProfit  *big.Int
+					Success    bool
+				}
+				err := executorABI.UnpackIntoInterface(&event, "ArbitrageExecuted", vLog.Data)
+				if err == nil && event.Success {
+					profitWei = event.Profit
+					break
+				}
+			}
+		}
+
+		var profitUSD float64
+		if profitWei != nil && profitWei.Sign() > 0 {
+			tokenPrice, ok := solver.GetTokenPrice(payload.BorrowedToken, matrix, &globalPriceCache)
+if !ok || tokenPrice <= 0 {
+    tokenPrice = 1.0
+}
+			decimals := solver.GetTokenDecimals(payload.BorrowedToken)
+			profitUSD = (float64FromBig(profitWei) / math.Pow10(decimals)) * tokenPrice
+			ethPrice := solver.GetEthPrice()
+			l2BaseFeeUSD := solver.GetCurrentL2BaseFeeUSD()
+			priorityFeeUSD := float64(payload.PriorityFeeWei) * ethPrice / 1e18
+			gasCostUSD := float64(receipt.GasUsed) * (l2BaseFeeUSD + priorityFeeUSD)
+			profitUSD -= gasCostUSD
+		} else {
+			profitUSD = payload.MinProfitUSD
+		}
+
 		profitMu.Lock()
 		totalProfit += profitUSD
 		profitMu.Unlock()
+
 		if dashServer != nil {
 			dashServer.AddProfit(profitUSD)
 			dashServer.SetTradeStatus("SUCCESS", "")
-			msg := fmt.Sprintf("[+] WIN | Tx: %s | Profit: $%.2f | Route: %s | Confirmed at block %d",
+			msg := fmt.Sprintf("[+] WIN | Tx: %s | Realised Profit: $%.2f | Route: %s | Block: %d",
 				txHash.Hex(), profitUSD, payload.RouteDesc, receipt.BlockNumber.Uint64())
 			dashServer.Log(msg)
 		}
-		log.Printf("[+] WIN | Tx: %s | Profit: $%.2f | Route: %s | Block: %d",
+		log.Printf("[+] WIN | Tx: %s | Realised Profit: $%.2f | Route: %s | Block: %d",
 			txHash.Hex(), profitUSD, payload.RouteDesc, receipt.BlockNumber.Uint64())
 	})
 
@@ -285,27 +432,129 @@ gatekeeper := gatekeeper.New(
 		return filtered
 	})
 
-	sender.SetSimulateFunc(func(cand *types.RouteCandidate, payload *types.ExecutionPayload) (bool, uint64, error) {
-		return gevm.SimulateNative(payload)
+	// ---- Set the rebuild function for retries ----
+	sender.SetRebuildFunc(func(payload *types.ExecutionPayload, cand *types.RouteCandidate) error {
+		loanProvider := payload.LoanProvider
+		loanPool := payload.LoanPool
+		loanToken := cand.Tokens[0]
+		loanAmount := cand.AmountIn
+
+		// Compute minProfitWei from cand's NetProfitWei or from ExpectedProfitUSD.
+		minProfitWei := cand.NetProfitWei
+		if minProfitWei == nil || minProfitWei.Sign() <= 0 {
+			tokenPrice, ok := solver.GetTokenPrice(loanToken, matrix, &globalPriceCache)
+if !ok || tokenPrice <= 0 {
+    tokenPrice = 1.0
+}
+			decimals := solver.GetTokenDecimals(loanToken)
+			profitWei := new(big.Float).Mul(
+				big.NewFloat(cand.ExpectedProfitUSD/tokenPrice),
+				big.NewFloat(math.Pow10(decimals)),
+			)
+			minProfitWei = new(big.Int)
+			profitWei.Int(minProfitWei)
+		}
+
+		deadline := uint64(time.Now().Unix()) + 120
+
+		// Build new calldata.
+		calldata, err := solver.BuildCalldata(
+			cand,
+			loanProvider,
+			loanPool,
+			loanToken,
+			loanAmount,
+			minProfitWei,
+			deadline,
+		)
+		if err != nil {
+			return fmt.Errorf("rebuild calldata: %w", err)
+		}
+
+		// Update payload.
+		payload.Calldata = make([]byte, len(calldata))
+		copy(payload.Calldata, calldata)
+		payload.BorrowedToken = loanToken
+		payload.BorrowedAmount = loanAmount
+		payload.MinProfitWei = new(big.Int).Set(minProfitWei)
+		payload.MinProfitUSD = cand.ExpectedProfitUSD
+		payload.RouteDesc = formatCandidateRoute(cand)
+		payload.RoutePools = make([]common.Address, int(cand.Hops))
+		copy(payload.RoutePools, cand.Pools[:cand.Hops])
+		payload.OriginalCandidate = cand
+
+		// Keep the same nonce (replacement transaction) – already set.
+		rawTx, txHash, err := sender.PrepareAndSignTransaction(payload)
+		if err != nil {
+			return fmt.Errorf("re-sign failed: %w", err)
+		}
+		payload.SignedRawTx = rawTx
+		payload.TxHash = txHash
+		return nil
 	})
 
-	decoder := ingestion.NewDecoder()
+	// ---- BOOTSTRAP: seed matrix with recent blocks ----
+	seedMatrixFromRecentBlocks(ethClient, gatekeeper)
 
+	// ---- Channels ----
 	eventChan := make(chan *types.SwapLog, eventChanSize)
 	candidateChan := make(chan *types.RouteCandidate, candidateChanSize)
 	executionChan := make(chan *types.ExecutionPayload, executionChanSize)
 
 	solver.StartL1FeeUpdater(ethClient, ctx)
 
+// ---- ETH price updater ----
+go func() {
+    ticker := time.NewTicker(10 * time.Second)
+    defer ticker.Stop()
+    for {
+        select {
+        case <-ctx.Done():
+            return
+        case <-ticker.C:
+            // Fetch ETH price from matrix (WETH/USDC)
+            price, ok := solver.GetTokenPrice(config.WETHAddress, matrix, &globalPriceCache)
+            if ok && price > 0 {
+                solver.SetEthPrice(price)
+                sender.SetEthPrice(price)
+            }
+        }
+    }
+}()
+// ---- Background cache cleaner for globalPriceCache ----
+go func() {
+    ticker := time.NewTicker(5 * time.Minute)
+    defer ticker.Stop()
+    for {
+        select {
+        case <-ctx.Done():
+            return
+        case <-ticker.C:
+            now := time.Now().UnixNano()
+            globalPriceCache.Range(func(key, value interface{}) bool {
+                entry, ok := value.(*solver.PriceEntry)
+                if ok && now-entry.Timestamp > int64(60*time.Second) {
+                    globalPriceCache.Delete(key)
+                }
+                return true
+            })
+        }
+    }
+}()
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 
 	statusChan := make(chan string, 1)
 
-    log.Println("[Main] Subscribing to ALL swap events (dynamic discovery enabled)")
-  go ingestion.StartWebSocketReader(ctx, cfg.BaseWSRPC, eventChan, decoder, statusChan, nil)
+	log.Println("[Main] Subscribing to ALL swap events (dynamic discovery enabled)")
+	decoder := ingestion.NewDecoder()
+	go func() {
+		defer recoverPanic("WebSocket reader")
+		ingestion.StartWebSocketReader(ctx, cfg.BaseWSRPC, eventChan, decoder, statusChan, nil)
+	}()
 
 	go func() {
+		defer recoverPanic("WebSocket status handler")
 		for status := range statusChan {
 			switch status {
 			case "connected":
@@ -315,6 +564,7 @@ gatekeeper := gatekeeper.New(
 			case "disconnected":
 				if dashServer != nil {
 					dashServer.SetConnectionStatus("🔴 Disconnected")
+			
 				}
 			}
 		}
@@ -327,33 +577,118 @@ gatekeeper := gatekeeper.New(
 		cores = []int{2, 3, 4}
 	}
 
-	wg.Add(1)
-go func() {
-    if cfg.EnableCPUPinning {
-        pinToCore(cores[0])
-    }
-    defer wg.Done()
-    worker1(ctx, eventChan, candidateChan, matrix, blacklist, lru, anchorSet, cfg, gatekeeper)
-}()
+	// ===== 4. Start Memory Guardian (removed – no longer needed) =====
 
+	// ===== 5. Start Speculative Multiverse Seeder (background) =====
+	go func() {
+		defer recoverPanic("Speculative seeder")
+		speculativeSeeder(ctx, matrix, lru, cfg)
+	}()
+
+	// ===== 6. Start Bonding Tracker =====
+	bondingExecutor := common.HexToAddress(cfg.BondingExecutorAddress)
+	bondingTracker := bonding.NewTracker(
+		ethClient,
+		blacklist,
+		dexCache,
+		memeCache,
+		[]common.Address{
+			common.HexToAddress("0xe85a59c628f7d27878aceb4bf3b35733630083a9"),
+			common.HexToAddress("0x1A540088125d00dD3990f9dA45CA0859af4d3B01"),
+		},
+		bondingExecutor,
+		uint64(cfg.MaxPriorityFeeGwei*1e9),
+		executionChan,
+		matrix,
+		&payloadPool,
+		cfg.BondingPollIntervalMs,
+	)
+	bondingTracker.SetWSURL(cfg.BaseWSRPC) // <-- Added
+	bondingTracker.SetGEVM(gevm)           // <-- Added
+
+	wg.Add(1)
+	go func() {
+		defer recoverPanic("Bonding tracker")
+		if cfg.EnableCPUPinning {
+			core := cfg.BondingCoreID
+			if core < 0 {
+				if len(cores) > 0 {
+					core = cores[len(cores)-1] + 1
+				} else {
+					core = 2
+				}
+			}
+			pinToCore(core)
+		}
+		defer wg.Done()
+		bondingTracker.Run(ctx)
+	}()
+// ===== 7. Start Liquidation Tracker =====
+if cfg.LiquidationEnabled {
+    liquidationTracker := liquidation.NewTracker(
+        ethClient,
+        gevm,             // pass GEVM for simulation
+        matrix,
+        executionChan,
+        &payloadPool,
+        uint64(cfg.MaxPriorityFeeGwei*1e9),
+        cfg,
+        0.05,
+    )
+liquidationTracker.SetWSURL(cfg.BaseWSRPC)
+    wg.Add(1)
+    go func() {
+        defer recoverPanic("Liquidation tracker")
+        if cfg.EnableCPUPinning {
+            core := cfg.LiquidationCoreID
+            if core < 0 {
+                if len(cores) > 0 {
+                    core = cores[len(cores)-1] + 2 // use a core not used by others
+                } else {
+                    core = 5
+                }
+            }
+            pinToCore(core)
+        }
+        defer wg.Done()
+        liquidationTracker.Run(ctx)
+    }()
+}
+	// ---- Worker1 ----
+	wg.Add(1)
+	go func() {
+		defer recoverPanic("Worker1")
+		if cfg.EnableCPUPinning {
+			pinToCore(cores[0])
+		}
+		defer wg.Done()
+		worker1(ctx, eventChan, candidateChan, executionChan, matrix, blacklist, lru, anchorSet, cfg, gatekeeper,bondingTracker, ethClient)
+	}()
+
+	// ---- Worker2 ----
 	for i := 0; i < numSimWorkers; i++ {
 		wg.Add(1)
 		go func(workerID int) {
+			defer recoverPanic(fmt.Sprintf("Worker2-%d", workerID))
 			if cfg.EnableCPUPinning && len(cores) > 2+workerID {
 				pinToCore(cores[2+workerID])
 			}
 			defer wg.Done()
-			worker2(ctx, candidateChan, executionChan, gevm, matrix, blacklist, anchorSet, cfg)
+			worker2(ctx, candidateChan, executionChan, gevm, matrix, blacklist, anchorSet, cfg, sender)
 		}(i)
 	}
 
+	// ---- Worker3 ----
+	broadcastWg := &sync.WaitGroup{}
+broadcastSem := make(chan struct{}, 8) // limit concurrent broadcasts
 	wg.Add(1)
 	go func() {
+		defer recoverPanic("Worker3")
 		if cfg.EnableCPUPinning {
 			pinToCore(cores[2])
 		}
 		defer wg.Done()
-		worker3(ctx, executionChan, sender, nonceTracker)
+		worker3(ctx, executionChan, sender, nonceTracker, pll, broadcastWg, broadcastSem)
 	}()
 
 	<-sigChan
@@ -361,14 +696,18 @@ go func() {
 	cancel()
 
 	if dashServer != nil {
-		dashServer.SetConnectionStatus("🔴 Disconnected")
-	}
+    dashServer.SetConnectionStatus("🔴 Disconnected")
+}
 
-	done := make(chan struct{})
-	go func() {
-		wg.Wait()
-		close(done)
-	}()
+// Wait for broadcast goroutines
+broadcastWg.Wait()
+log.Println("All broadcast goroutines finished.")
+
+done := make(chan struct{})
+go func() {
+    wg.Wait()
+    close(done)
+}()
 	select {
 	case <-done:
 		log.Println("All workers finished.")
@@ -378,6 +717,166 @@ go func() {
 	log.Println("Bot stopped.")
 }
 
+// ===== Additional Functions =====
+
+func recoverPanic(name string) {
+	if r := recover(); r != nil {
+		log.Printf("[PANIC] %s recovered: %v", name, r)
+	}
+}
+
+// memoryGuardian removed – no longer used.
+
+// speculativeSeeder – seeds multiverse cache without reserving nonces.
+func speculativeSeeder(ctx context.Context, matrix *state.Matrix, lru *state.LRUCache, cfg *config.Config) {
+	ticker := time.NewTicker(180 * time.Millisecond)
+	defer ticker.Stop()
+
+	// Pre‑allocate weighted slice to reuse.
+	weighted := make([]weightedPool, 0, 32)
+
+	// Build anchor set for filtering.
+	anchors := config.AnchorAssets()
+	anchorSet := make(map[common.Address]bool, len(anchors))
+	for _, a := range anchors {
+		anchorSet[a] = true
+	}
+
+	// Determine loan provider and loan pool (same logic as worker2).
+	var loanProvider uint8
+	var loanPool common.Address
+	switch cfg.LoanProvider {
+	case "BALANCER":
+		loanProvider = 0
+		loanPool = config.BalancerVault
+	case "DODO":
+		dodoAddr := common.HexToAddress(cfg.DODOPoolAddress)
+		if dodoAddr == (common.Address{}) {
+			loanProvider = 0
+			loanPool = config.BalancerVault
+		} else {
+			loanProvider = 1
+			loanPool = dodoAddr
+		}
+	case "AUTO":
+		if cfg.DODOPoolAddress != "" {
+			dodoAddr := common.HexToAddress(cfg.DODOPoolAddress)
+			if dodoAddr != (common.Address{}) {
+				loanProvider = 1
+				loanPool = dodoAddr
+				break
+			}
+		}
+		loanProvider = 0
+		loanPool = config.BalancerVault
+	default:
+		loanProvider = 0
+		loanPool = config.BalancerVault
+	}
+
+	priorityFee := uint64(cfg.MaxPriorityFeeGwei * 1e9)
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			// If few meme pools, sleep longer.
+			if matrix.PoolCount() < 3 {
+				time.Sleep(5 * time.Second)
+				continue
+			}
+
+			weighted = weighted[:0]
+			matrix.RangePools(func(poolAddr common.Address, pool *types.PoolState) bool {
+				if !anchorSet[pool.Token0] || !anchorSet[pool.Token1] {
+					stats := matrix.GetPoolStats(poolAddr)
+					score := 0.0
+					if stats != nil {
+						score = float64(stats.SwapsWindow1m)*0.7 + stats.LastLiquidityUSD*0.3
+					}
+					var addr [20]byte
+					copy(addr[:], poolAddr.Bytes())
+					weighted = append(weighted, weightedPool{addr, score})
+				}
+				return true
+			})
+
+			if len(weighted) == 0 {
+				continue
+			}
+			sort.Slice(weighted, func(i, j int) bool {
+				return weighted[i].score > weighted[j].score
+			})
+			memePools := make([][20]byte, 0, 5)
+			for i := 0; i < len(weighted) && i < 5; i++ {
+				memePools = append(memePools, weighted[i].addr)
+			}
+
+			if len(memePools) > 0 {
+				// Call with all required parameters.
+				predictive.SeedNextSubBlockBranches(memePools, matrix, cfg, loanProvider, loanPool, priorityFee)
+			}
+		}
+	}
+}
+
+type weightedPool struct {
+	addr  [20]byte
+	score float64
+}
+
+// seedMatrixFromRecentBlocks (unchanged)
+func seedMatrixFromRecentBlocks(client *ethclient.Client, gk *gatekeeper.Gatekeeper) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	header, err := client.HeaderByNumber(ctx, nil)
+	if err != nil {
+		log.Printf("[Bootstrap] Failed to get latest block: %v", err)
+		return
+	}
+	currentBlock := header.Number.Uint64()
+	if currentBlock < 50 {
+		log.Printf("[Bootstrap] Chain height < 50; skipping seed")
+		return
+	}
+	fromBlock := currentBlock - 50
+
+	v2Topic := common.HexToHash("0xd78ad95fa46c994b6551d0da85fc275fe613ce37657fb8d5e3d130840159d822")
+	v3Topic := common.HexToHash("0xc42079f94a6350d7e6235f29174924f928cc2ac818eb64fed8004e115fbcca67")
+
+	query := ethereum.FilterQuery{
+		FromBlock: big.NewInt(int64(fromBlock)),
+		ToBlock:   header.Number,
+		Topics:    [][]common.Hash{{v2Topic, v3Topic}},
+	}
+
+	logs, err := client.FilterLogs(ctx, query)
+	if err != nil {
+		log.Printf("[Bootstrap] FilterLogs failed: %v", err)
+		return
+	}
+
+	seen := make(map[common.Address]bool)
+	var poolAddrs []common.Address
+	for _, vLog := range logs {
+		if !seen[vLog.Address] {
+			seen[vLog.Address] = true
+			poolAddrs = append(poolAddrs, vLog.Address)
+		}
+	}
+
+	log.Printf("[Bootstrap] Found %d unique pools in last 50 blocks", len(poolAddrs))
+
+	for _, addr := range poolAddrs {
+		dummyLog := &types.SwapLog{
+			Address:     addr,
+			BlockNumber: currentBlock,
+		}
+		gk.ProcessLog(dummyLog)
+	}
+}
 
 // ---------------------------------------------------------------------
 // Worker functions
@@ -387,12 +886,15 @@ func worker1(
 	ctx context.Context,
 	eventChan <-chan *types.SwapLog,
 	candidateChan chan<- *types.RouteCandidate,
+	executionChan chan<- *types.ExecutionPayload,
 	matrix *state.Matrix,
 	blacklist *state.Blacklist,
 	lru *state.LRUCache,
 	anchorSet map[common.Address]bool,
 	cfg *config.Config,
 	gatekeeper *gatekeeper.Gatekeeper,
+	bondingTracker *bonding.Tracker,
+	ethClient *ethclient.Client,
 ) {
 	var localCandidates [maxCandidatesPerEvent]*types.RouteCandidate
 	candidateCount := 0
@@ -406,21 +908,71 @@ func worker1(
 				return
 			}
 
-			// ---- NEW: Gatekeeper Integration ----
-			// Check if pool exists in matrix
+		
+// ---- Re‑org detection ----
+var blockHash common.Hash
+// Try to get from cache first (most logs are from the latest block)
+if info := latestBlock.Load(); info != nil {
+    bi := info.(*blockInfo)
+    if bi.Number == swapLog.BlockNumber {
+        blockHash = bi.Hash
+    }
+}
+// If cache miss (e.g., lag), fallback to RPC
+if blockHash == (common.Hash{}) {
+    header, err := ethClient.HeaderByNumber(ctx, new(big.Int).SetUint64(swapLog.BlockNumber))
+    if err != nil {
+        log.Printf("[Worker1] Failed to fetch header for block %d: %v", swapLog.BlockNumber, err)
+        ingestion.PutSwapLog(swapLog)
+        continue
+    }
+    blockHash = header.Hash()
+}
+
+if matrix.IsReorg(swapLog.BlockNumber, blockHash) {
+    log.Printf("[Worker1] Re‑org detected at block %d (hash %s), clearing matrix and reseeding...",
+        swapLog.BlockNumber, blockHash.Hex())
+    matrix.Clear()
+    if bondingTracker != nil {
+        bondingTracker.Clear()
+    }
+    seedMatrixFromRecentBlocks(ethClient, gatekeeper)
+    matrix.UpdateLastBlock(swapLog.BlockNumber, blockHash)
+    ingestion.PutSwapLog(swapLog)
+    continue
+}
+			// ---- Pause check ----
+			if atomic.LoadInt32(&dashboard.BotRunning) == 0 {
+				ingestion.PutSwapLog(swapLog)
+				select {
+				case <-ctx.Done():
+					return
+				case <-time.After(50 * time.Millisecond):
+				}
+				continue
+			}
+
+			// ===== SHORT‑CIRCUIT =====
+			if payload, matched := predictive.ShortCircuitEvaluate(swapLog.RawJSON); matched {
+				select {
+				case executionChan <- payload:
+				default:
+					log.Printf("[Worker1] Execution channel full, dropping short‑circuit payload for %s", swapLog.Address.Hex())
+				}
+				ingestion.PutSwapLog(swapLog)
+				continue
+			}
+
+			// ===== Normal processing =====
 			pool := matrix.GetPool(swapLog.Address)
 			if pool == nil {
-				// Unknown pool – offload discovery to gatekeeper (non‑blocking)
+				// Unknown pool – offload to gatekeeper (non‑blocking)
 				gatekeeper.ProcessLog(swapLog)
 				ingestion.PutSwapLog(swapLog)
 				continue
 			}
-			// ---- End Gatekeeper Integration ----
-
-			// Known pool – update state
 			matrix.UpdateFromLog(swapLog)
 
-			// Ensure TokenIn/TokenOut are set
 			if swapLog.TokenIn == (common.Address{}) || swapLog.TokenOut == (common.Address{}) {
 				if pool != nil {
 					swapLog.TokenIn = pool.Token0
@@ -431,30 +983,30 @@ func worker1(
 			// Copy log for retry context
 			lastLogMu.Lock()
 			copyLog := &types.SwapLog{
-				Address:          swapLog.Address,
-				Topics:           append([]common.Hash{}, swapLog.Topics...),
-				Data:             append([]byte{}, swapLog.Data...),
-				BlockNumber:      swapLog.BlockNumber,
-				TxIndex:          swapLog.TxIndex,
-				TxHash:           swapLog.TxHash,
-				Timestamp:        swapLog.Timestamp,
-				TokenIn:          swapLog.TokenIn,
-				TokenOut:         swapLog.TokenOut,
-				AmountIn:         new(big.Int).Set(swapLog.AmountIn),
-				AmountOut:        new(big.Int).Set(swapLog.AmountOut),
-				AmountInFloat:    swapLog.AmountInFloat,
-				AmountOutFloat:   swapLog.AmountOutFloat,
-				SqrtPriceX96:     new(big.Int).Set(swapLog.SqrtPriceX96),
-				Liquidity:        new(big.Int).Set(swapLog.Liquidity),
-				Tick:             swapLog.Tick,
+				Address:           swapLog.Address,
+				Topics:            append([]common.Hash{}, swapLog.Topics...),
+				Data:              append([]byte{}, swapLog.Data...),
+				BlockNumber:       swapLog.BlockNumber,
+				TxIndex:           swapLog.TxIndex,
+				TxHash:            swapLog.TxHash,
+				Timestamp:         swapLog.Timestamp,
+				TokenIn:           swapLog.TokenIn,
+				TokenOut:          swapLog.TokenOut,
+				AmountIn:          new(big.Int).Set(swapLog.AmountIn),
+				AmountOut:         new(big.Int).Set(swapLog.AmountOut),
+				AmountInFloat:     swapLog.AmountInFloat,
+				AmountOutFloat:    swapLog.AmountOutFloat,
+				SqrtPriceX96:      new(big.Int).Set(swapLog.SqrtPriceX96),
+				Liquidity:         new(big.Int).Set(swapLog.Liquidity),
+				Tick:              swapLog.Tick,
 				SqrtPriceX96Float: swapLog.SqrtPriceX96Float,
 				LiquidityFloat:    swapLog.LiquidityFloat,
 			}
 			lastSwapLog = copyLog
 			lastLogMu.Unlock()
 
-			// Evaluate candidates
 			candidates := solver.EvaluateEvent(swapLog, matrix, cfg)
+
 			candidateCount = 0
 			for _, cand := range candidates {
 				blacklisted := false
@@ -477,8 +1029,6 @@ func worker1(
 					break
 				}
 			}
-
-			// Send candidates to channel
 			for i := 0; i < candidateCount; i++ {
 				select {
 				case candidateChan <- localCandidates[i]:
@@ -498,28 +1048,13 @@ func worker1(
 					lru.Put(tok)
 				}
 			}
-
-			// Return log to pool
+			matrix.UpdateLastBlock(swapLog.BlockNumber, blockHash)
 			ingestion.PutSwapLog(swapLog)
 		}
 	}
 }
 
-// getTokenDecimals (unchanged)
-func getTokenDecimals(token common.Address) int {
-	if token == config.USDCAddress || token == config.USDBCAddress {
-		return 6
-	}
-	if token == config.CBBTCAddress {
-		return 8
-	}
-	if token == config.WETHAddress {
-		return 18
-	}
-	return 18
-}
-
-// worker2 – fixed context leak and remote fallback
+// worker2 – simulates and submits payloads. Does not reserve nonces.
 func worker2(
 	ctx context.Context,
 	candidateChan <-chan *types.RouteCandidate,
@@ -529,12 +1064,35 @@ func worker2(
 	blacklist *state.Blacklist,
 	anchorSet map[common.Address]bool,
 	cfg *config.Config,
+	sender *execution.Sender,
 ) {
-	priorityFeeWei := uint64(cfg.MaxPriorityFeeGwei * 1e9)
+	// Priority fee refresh
+	var priorityFeeWei uint64
+	if dynFee, err := sender.GetDynamicPriorityFee(ctx); err == nil && dynFee > 0 {
+		priorityFeeWei = dynFee
+	} else {
+		priorityFeeWei = uint64(cfg.MaxPriorityFeeGwei * 1e9)
+	}
+	var priorityFeeAtomic atomic.Uint64
+	priorityFeeAtomic.Store(priorityFeeWei)
+
+	go func() {
+		ticker := time.NewTicker(10 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				if dynFee, err := sender.GetDynamicPriorityFee(ctx); err == nil && dynFee > 0 {
+					priorityFeeAtomic.Store(dynFee)
+				}
+			}
+		}
+	}()
 
 	var loanProvider uint8
 	var loanPool common.Address
-
 	switch cfg.LoanProvider {
 	case "BALANCER":
 		loanProvider = 0
@@ -573,19 +1131,36 @@ func worker2(
 			if !ok {
 				return
 			}
+			if atomic.LoadInt32(&dashboard.BotRunning) == 0 {
+				select {
+				case <-ctx.Done():
+					return
+				case <-time.After(50 * time.Millisecond):
+				}
+				continue
+			}
+
+			// ---- ETH price check (fail‑closed) ----
+			ethPrice := solver.GetEthPrice()
+			if ethPrice <= 1.0 || ethPrice == 3000.0 { // 3000 is the uninitialised default
+				log.Printf("[Worker2] Skipping trade: ETH price not valid (%.2f)", ethPrice)
+				// drop candidate (no payload to release)
+				continue
+			}
 
 			start := time.Now()
-
 			loanToken := cand.Tokens[0]
 			loanAmount := cand.AmountIn
 
 			minProfitWei := cand.NetProfitWei
 			if minProfitWei == nil || minProfitWei.Sign() <= 0 {
-				tokenPrice := solver.GetTokenPrice(loanToken, matrix, &globalPriceCache)
-				if tokenPrice <= 0 {
-					tokenPrice = 1.0
-				}
-				decimals := getTokenDecimals(loanToken)
+				tokenPrice, ok := solver.GetTokenPrice(loanToken, matrix, &globalPriceCache)
+if !ok || tokenPrice <= 0 {
+    // skip trade or use fallback
+    log.Printf("Skipping trade: unknown price for token %s", loanToken.Hex())
+continue
+}
+				decimals := solver.GetTokenDecimals(loanToken)
 				profitWei := new(big.Float).Mul(
 					big.NewFloat(cand.ExpectedProfitUSD/tokenPrice),
 					big.NewFloat(math.Pow10(decimals)),
@@ -610,25 +1185,36 @@ func worker2(
 				continue
 			}
 
-			backend := gevm.ChooseBackend(cand)
-			simPayload := &types.ExecutionPayload{
-				TargetExecutor: cfg.ExecutorAddress,
-				Calldata:       calldata,
-				GasLimit:       defaultGasLimit,
-			}
+			payload := getPayload()
+			payload.Reset()
+			payload.TargetExecutor = cfg.ExecutorAddress
+			payload.LoanProvider = loanProvider
+			payload.LoanPool = loanPool
+			payload.BorrowedToken = loanToken
+			payload.BorrowedAmount = loanAmount
+			payload.Calldata = calldata
+			payload.GasLimit = defaultGasLimit
+			payload.PriorityFeeWei = priorityFeeAtomic.Load()
+			payload.MinProfitWei = new(big.Int).Set(minProfitWei)
+			payload.DetectionTime = start
+			payload.RouteDesc = formatCandidateRoute(cand)
+			payload.RoutePools = make([]common.Address, int(cand.Hops))
+			copy(payload.RoutePools, cand.Pools[:cand.Hops])
+			payload.OriginalCandidate = cand
+			payload.Nonce = 0 // will be set in worker3
 
+			// Simulation
+			backend := gevm.ChooseBackend(cand)
 			var success bool
 			var gasUsed uint64
 
 			if backend == execution.SimBackendLocal {
-				// No context needed for local simulation – it's synchronous.
-				success, gasUsed, err = gevm.SimulateNative(simPayload)
+				success, gasUsed, err = gevm.SimulateNative(payload)
 				if err != nil || !success {
-					// Fall back to remote if local fails.
-					success, gasUsed, err = gevm.SimulateWithBackend(cand, simPayload, execution.SimBackendRemote)
+					success, gasUsed, err = gevm.SimulateWithBackend(cand, payload, execution.SimBackendRemote)
 				}
 			} else {
-				success, gasUsed, err = gevm.SimulateWithBackend(cand, simPayload, backend)
+				success, gasUsed, err = gevm.SimulateWithBackend(cand, payload, backend)
 			}
 
 			if err != nil || !success {
@@ -642,63 +1228,50 @@ func worker2(
 					}
 				}
 				logDrop(cand, err)
+				putPayload(payload)
 				continue
 			}
 
-			gasLimit := gasUsed + gasUsed/5
+			gasLimit := uint64(float64(gasUsed) * 1.05)
 			if gasLimit < defaultGasLimit {
 				gasLimit = defaultGasLimit
 			}
+			payload.GasLimit = gasLimit
 
-			ethPrice := solver.GetEthPrice()
+			// Profit check (with valid ETH price)
 			l1BaseFeeUSD := solver.GetCurrentL1BaseFeeUSD()
-			l2TipUSD := float64(priorityFeeWei) * ethPrice / 1e18
-			totalGasCostUSD := float64(gasUsed) * (l1BaseFeeUSD + l2TipUSD)
-
+			l2BaseFeeUSD := solver.GetCurrentL2BaseFeeUSD()
+			priorityFeeUSD := float64(payload.PriorityFeeWei) * ethPrice / 1e18
+			totalGasCostUSD := float64(gasUsed) * (l1BaseFeeUSD + l2BaseFeeUSD + priorityFeeUSD)
 			adjustedProfitUSD := cand.ExpectedProfitUSD - totalGasCostUSD
-
 			if adjustedProfitUSD < cfg.MinProfitUSD {
 				logDrop(cand, fmt.Errorf("gas-adjusted profit $%.2f below minimum $%.2f",
 					adjustedProfitUSD, cfg.MinProfitUSD))
+				putPayload(payload)
 				continue
 			}
-
-			payload := getPayload()
-			payload.Reset()
-			payload.TargetExecutor = cfg.ExecutorAddress
-			payload.LoanProvider = loanProvider
-			payload.LoanPool = loanPool
-			payload.BorrowedToken = loanToken
-			payload.BorrowedAmount = loanAmount
-			payload.Calldata = make([]byte, len(calldata))
-			copy(payload.Calldata, calldata)
-			payload.GasLimit = gasLimit
-			payload.PriorityFeeWei = priorityFeeWei
 			payload.MinProfitUSD = adjustedProfitUSD
-			payload.MinProfitWei = new(big.Int).Set(minProfitWei)
-			payload.DetectionTime = start
-			payload.Nonce = 0
-			payload.RouteDesc = formatCandidateRoute(cand)
-			payload.RoutePools = make([]common.Address, int(cand.Hops))
-			payload.OriginalCandidate = cand
-			copy(payload.RoutePools, cand.Pools[:cand.Hops])
 
 			select {
 			case executionChan <- payload:
 			default:
-				putPayload(payload)
 				log.Println("[Worker2] Execution channel full, dropping payload")
+				putPayload(payload)
 			}
 		}
 	}
 }
 
-// worker3 – fixed nonce race: sign synchronously, broadcast asynchronously
+// worker3 – assigns nonce, signs, and broadcasts via BroadcastWithRetry.
+// Now limits concurrency and tracks goroutines.
 func worker3(
 	ctx context.Context,
 	executionChan <-chan *types.ExecutionPayload,
 	sender *execution.Sender,
 	nonceTracker *state.NonceTracker,
+	pll *predictive.FlashblockPLL,
+	broadcastWg *sync.WaitGroup,
+	broadcastSem chan struct{},
 ) {
 	for {
 		select {
@@ -708,51 +1281,105 @@ func worker3(
 			if !ok {
 				return
 			}
-			nonce := nonceTracker.NextNonce()
-			payload.Nonce = nonce
-
-			// Sign synchronously to guarantee nonce order.
-			rawTx, txHash, err := sender.PrepareAndSignTransaction(payload)
-			if err != nil {
-				nonceTracker.Rollback()
-				msg := fmt.Sprintf("[-] DROP | Tx signing failed | Reason: %v", err)
-				log.Println(msg)
-				if dashServer != nil {
-					dashServer.Log(msg)
-					dashServer.SetTradeStatus("FAILED", err.Error())
-				}
+			if atomic.LoadInt32(&dashboard.BotRunning) == 0 {
 				putPayload(payload)
+				select {
+				case <-ctx.Done():
+					return
+				case <-time.After(50 * time.Millisecond):
+				}
 				continue
 			}
 
-			log.Printf("[+] PENDING | Tx: %s | Profit: $%.2f | GasTip: %.3f Gwei | Route: %s",
-				txHash.Hex(),
+			// Assign nonce if not already set.
+			if payload.Nonce == 0 {
+				payload.Nonce = nonceTracker.NextNonce()
+			}
+			nonce := payload.Nonce
+
+			log.Printf("[+] PENDING | Nonce: %d | Profit: $%.2f | GasTip: %.3f Gwei | Route: %s",
+				nonce,
 				payload.MinProfitUSD,
 				float64(payload.PriorityFeeWei)/1e9,
 				payload.RouteDesc,
 			)
 
-			// Broadcast asynchronously to avoid blocking the loop.
-			go func(raw []byte, p *types.ExecutionPayload, n uint64) {
-				err := sender.BroadcastRawTransactionBytes(raw)
+			// Acquire semaphore (blocks if too many concurrent broadcasts)
+			select {
+			case broadcastSem <- struct{}{}:
+				// acquired
+			case <-ctx.Done():
+				putPayload(payload)
+				return
+			}
+
+			broadcastWg.Add(1)
+			go func(p *types.ExecutionPayload, n uint64) {
+				defer func() {
+					if r := recover(); r != nil {
+						log.Printf("[PANIC] Broadcast goroutine: %v", r)
+						if p.Nonce > 0 {
+							nonceTracker.Rollback()
+						}
+						putPayload(p)
+					}
+					// Release semaphore and mark done
+					<-broadcastSem
+					broadcastWg.Done()
+				}()
+
+				// Sign if not already signed
+				if len(p.SignedRawTx) == 0 {
+					rawTx, txHash, err := sender.PrepareAndSignTransaction(p)
+					if err != nil {
+						log.Printf("[Worker3] Signing failed for %s: %v", p.RouteDesc, err)
+						if p.Nonce > 0 {
+							nonceTracker.Rollback()
+						}
+						putPayload(p)
+						return
+					}
+					p.SignedRawTx = rawTx
+					p.TxHash = txHash
+				}
+
+				// ---- Predictive scheduling ----
+				dispatchTime := pll.OptimalDispatchTime()
+				if dispatchTime.After(time.Now()) {
+					sleepDuration := dispatchTime.Sub(time.Now())
+					if sleepDuration > 0 && sleepDuration < 200*time.Millisecond {
+						time.Sleep(sleepDuration)
+					}
+				}
+
+				retryCtx := execution.RetryContext{
+					Pools:             p.RoutePools,
+					OriginalCandidate: p.OriginalCandidate,
+					LoanToken:         p.BorrowedToken,
+				}
+				if p.OriginalCandidate != nil {
+					retryCtx.Tokens = p.OriginalCandidate.Tokens[:int(p.OriginalCandidate.Hops)+1]
+				} else {
+					retryCtx.Tokens = []common.Address{}
+				}
+
+				err := sender.BroadcastWithRetry(p, retryCtx)
 				if err != nil {
-					// Do NOT rollback nonce – transaction may have been partially sent.
-					msg := fmt.Sprintf("[-] DROP | Tx broadcast failed | Reason: %v", err)
+					msg := fmt.Sprintf("[-] DROP | Tx broadcast failed after retries | Reason: %v", err)
 					log.Println(msg)
 					if dashServer != nil {
 						dashServer.Log(msg)
 						dashServer.SetTradeStatus("FAILED", err.Error())
 					}
-					putPayload(p)
-					return
+					// BroadcastWithRetry already does rollback + putPayload on failure.
+					// No extra cleanup needed.
 				}
-				sender.RegisterPendingNonce(n, p)
-			}(rawTx, payload, nonce)
+				// On success, BroadcastWithRetry calls confCallback -> putPayload.
+			}(payload, nonce)
 		}
 	}
 }
-
-// printStartupBanner (unchanged)
+// printStartupBanner
 func printStartupBanner(cfg *config.Config) {
 	fmt.Println("=== Base Flash Arbitrage Bot ===")
 	fmt.Printf("WS RPC:        %s\n", cfg.BaseWSRPC)
@@ -764,7 +1391,7 @@ func printStartupBanner(cfg *config.Config) {
 	fmt.Println("=================================")
 }
 
-// logDrop (unchanged)
+// logDrop
 func logDrop(cand *types.RouteCandidate, err error) {
 	var msg string
 	if cand == nil {
@@ -791,13 +1418,13 @@ func logDrop(cand *types.RouteCandidate, err error) {
 	}
 }
 
-// formatCandidateRoute (unchanged)
+// formatCandidateRoute
 func formatCandidateRoute(cand *types.RouteCandidate) string {
 	if cand == nil || cand.Hops == 0 {
 		return "unknown"
 	}
-	tokens := cand.Tokens[:cand.Hops+1]
-	dexes := cand.DexTypes[:cand.Hops]
+	tokens := cand.Tokens[:int(cand.Hops)+1]
+	dexes := cand.DexTypes[:int(cand.Hops)]
 	route := ""
 	for i := 0; i < int(cand.Hops); i++ {
 		if i > 0 {
@@ -809,7 +1436,7 @@ func formatCandidateRoute(cand *types.RouteCandidate) string {
 	return route
 }
 
-// dexName (unchanged)
+// dexName
 func dexName(t types.DexType) string {
 	switch t {
 	case types.DexUniswapV3:
@@ -823,4 +1450,14 @@ func dexName(t types.DexType) string {
 	default:
 		return "Unknown"
 	}
+}
+
+// float64FromBig
+func float64FromBig(v *big.Int) float64 {
+	if v == nil {
+		return 0
+	}
+	f := new(big.Float).SetInt(v)
+	val, _ := f.Float64()
+	return val
 }
