@@ -626,7 +626,8 @@ func (t *Tracker) updateAavePosition(ctx context.Context, user common.Address) {
 		DebtAmount:         debtAmount,
 		CollateralAsset:    collateralAsset,
 		DebtAsset:          debtAsset,
-	}
+		}
+	_ = pos
 	t.storePosition(user, pos)
 	if health < 1.0 {
 		t.triggerLiquidation(pos)
@@ -751,6 +752,7 @@ func (t *Tracker) updateCompoundPosition(ctx context.Context, user common.Addres
 		CollateralAsset:    collateralAsset,
 		DebtAsset:          config.USDCAddress,
 	}
+	_ = pos
 	t.storePosition(user, pos)
 	if health < 1.0 {
 		t.triggerLiquidation(pos)
@@ -761,22 +763,16 @@ func (t *Tracker) updateCompoundPosition(ctx context.Context, user common.Addres
 func (t *Tracker) updateMorphoPosition(ctx context.Context, user common.Address) {
 	morpho := t.protocols[ProtocolMorpho].PoolAddress
 
-	// We need to know which markets the user is in. For simplicity, we'll query a known market ID.
-	// In production, you'd iterate over all market IDs from a registry.
-	// For this implementation, we use a hardcoded market ID for WETH/USDC (computed from token pair and oracle).
-	// We'll also provide a function to derive the market ID.
 	marketID := t.getMorphoMarketID(config.USDCAddress, config.WETHAddress)
 	if marketID == (common.Hash{}) {
 		return
 	}
 
-	// Get market params
 	params, err := t.fetchMorphoMarketParams(ctx, morpho, marketID)
 	if err != nil {
 		return
 	}
 
-	// Fetch user position
 	callData, _ := morphoBlueABI.Pack("position", user, params.Market)
 	msg := ethereum.CallMsg{To: &morpho, Data: callData}
 	out, err := t.client.CallContract(ctx, msg, nil)
@@ -796,7 +792,6 @@ func (t *Tracker) updateMorphoPosition(ctx context.Context, user common.Address)
 		return
 	}
 
-	// Convert to USD – we need price of collateral token and loan token
 	collateralPrice, ok := solver.GetTokenPrice(params.CollateralToken, t.matrix, nil)
 	if !ok || collateralPrice <= 0 {
 		return
@@ -812,32 +807,35 @@ func (t *Tracker) updateMorphoPosition(ctx context.Context, user common.Address)
 
 	health := 0.0
 	if debtUSD > 0 {
-		// Morpho uses lltv: health = collateral * lltv / debt
 		lltv := float64FromBig(params.LLTV) / 1e18
 		health = (collateralUSD * lltv) / debtUSD
 	}
 
 	pos := &UserPosition{
-    User:               user,
-    Protocol:           ProtocolMorpho,
-    TotalCollateralUSD: collateralUSD,
-    TotalDebtUSD:       debtUSD,
-    HealthFactor:       health,
-    LastUpdated:        time.Now(),
-    DebtAmount:         borrow,
-    CollateralAmount:   collateral,    // <-- FIX: set from position call
-    CollateralAsset:    params.CollateralToken,
-    DebtAsset:          params.LoanToken,
-    MarketParams:       []interface{}{
-        params.LoanToken,
-        params.CollateralToken,
-        params.Oracle,
-        params.IRM,      // <-- FIX: added IRM
-        params.LLTV,
-    },
+		User:               user,
+		Protocol:           ProtocolMorpho,
+		TotalCollateralUSD: collateralUSD,
+		TotalDebtUSD:       debtUSD,
+		HealthFactor:       health,
+		LastUpdated:        time.Now(),
+		DebtAmount:         borrow,
+		CollateralAmount:   collateral,
+		CollateralAsset:    params.CollateralToken,
+		DebtAsset:          params.LoanToken,
+		MarketParams: []interface{}{
+			params.LoanToken,
+			params.CollateralToken,
+			params.Oracle,
+			params.IRM,
+			params.LLTV,
+		},
+	}
+	_ = pos // explicit use to satisfy compiler
+	t.storePosition(user, pos)
+	if health < 1.0 {
+		t.triggerLiquidation(pos)
+	}
 }
-}
-
 func (t *Tracker) getMorphoMarketID(loanToken, collateralToken common.Address) common.Hash {
     // Chainlink WETH/USD oracle on Base (verified)
     oracle := common.HexToAddress("0x71041dddad3595F9CEd3DcCFBe3D1F4b0a16Bb70")
@@ -954,6 +952,7 @@ func (t *Tracker) updateExactlyPosition(ctx context.Context, user common.Address
 		DebtAsset:          debtAsset,
 		CollateralMarket:   collateralMarket,
 	}
+	_ = pos
 	t.storePosition(user, pos)
 	if health < 1.0 {
 		t.triggerLiquidation(pos)
@@ -1023,6 +1022,7 @@ func (t *Tracker) updateMoonwellPosition(ctx context.Context, user common.Addres
 		CollateralAsset:    underlying,
 		DebtAsset:          config.USDCAddress, // assuming debt is WETH
 	}
+	_ = pos
 	t.storePosition(user, pos)
 	if health < 1.0 {
 		t.triggerLiquidation(pos)
@@ -1083,6 +1083,7 @@ func (t *Tracker) updateIonicPosition(ctx context.Context, user common.Address) 
 		CollateralAsset:     config.WETHAddress, 
 		DebtAsset:          config.USDCAddress, 
 	}
+	_ = pos
 	t.storePosition(user, pos)
 	if health < 1.0 {
 		t.triggerLiquidation(pos)
@@ -1367,7 +1368,7 @@ func packLiquidationData(protocol uint8, args ...interface{}) []byte {
 			{Type: mustParseType("address"), Name: "collateral"},
 			{Type: mustParseType("uint256"), Name: "minAmount"},
 		}
-	case ProtocolMorpho:
+case ProtocolMorpho:
     tupleType, err := abi.NewType("tuple", "", []abi.ArgumentMarshaling{
         {Name: "loanToken", Type: "address"},
         {Name: "collateralToken", Type: "address"},
