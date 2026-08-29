@@ -28,29 +28,26 @@ contract FlashArbExecutor is
     error InvalidBorrowedAsset();
     error InvalidHopCount();
     error UnsupportedPoolType();
+    error ZeroFeeBps();
 
     enum LoanProvider { BALANCER, DODO }
     enum ExecutionState { IDLE, LOAN_ACTIVE, SWAP_ACTIVE, COMPLETE }
     enum DexType { UNISWAP_V3, PANCAKE_V3, AERODROME_V2, ALIENBASE_V2 }
 
-    // ================================================================
-    // UPDATED: RouteData now includes full token path and per‑hop fees
-    // ================================================================
     struct RouteData {
-        address[] pools;        // pool address for each hop
-        address[] tokens;       // full token path (length = pools.length + 1)
-        DexType[] dexTypes;     // DEX type for each hop
-        bool[] zeroForOnes;     // swap direction for each hop
-        uint256[] minOuts;      // minimum output for each hop
-        uint256[] feeBps;       // fee in basis points for each hop (V2 only; V3 ignores)
-        uint256 amountIn;       // amount to borrow / input for first hop
+        address[] pools;
+        address[] tokens;
+        DexType[] dexTypes;
+        bool[] zeroForOnes;
+        uint256[] minOuts;
+        uint256[] feeBps;
+        uint256 amountIn;
     }
 
     address public immutable owner;
     IBalancerVault public immutable balancerVault;
     mapping(address => bool) public whitelistedDodoPools;
-
-    // (Removed poolFeeBps – now passed in RouteData)
+    bool private _locked; // reentrancy guard
 
     struct ExecutionContext {
         ExecutionState state;
@@ -100,6 +97,12 @@ contract FlashArbExecutor is
         if (_ctx.state != ExecutionState.IDLE) revert InvalidExecutionState();
         _;
     }
+    modifier noReentrancy() {
+        require(!_locked, "Reentrancy");
+        _locked = true;
+        _;
+        _locked = false;
+    }
 
     constructor(address _balancerVault) {
         if (_balancerVault == address(0)) revert UnauthorizedProvider();
@@ -107,6 +110,16 @@ contract FlashArbExecutor is
         balancerVault = IBalancerVault(_balancerVault);
         _ctx.state = ExecutionState.IDLE;
         _ctx.hopPaid = false;
+    }
+
+    function approveToken(address token) external onlyOwner {
+        IERC20(token).approve(address(balancerVault), type(uint256).max);
+    }
+
+    function approveAllTokens(address[] calldata tokens) external onlyOwner {
+        for (uint i = 0; i < tokens.length; i++) {
+            IERC20(tokens[i]).approve(address(balancerVault), type(uint256).max);
+        }
     }
 
     // ---- Owner admin ----
@@ -139,7 +152,7 @@ contract FlashArbExecutor is
         RouteData calldata route,
         uint256 minProfitWei,
         uint256 deadline
-    ) external onlyOwner onlyIdle {
+    ) external onlyOwner onlyIdle noReentrancy {
         if (deadline < block.timestamp) revert StaleTransaction();
 
         if (provider == LoanProvider.BALANCER) {
@@ -157,6 +170,10 @@ contract FlashArbExecutor is
             route.zeroForOnes.length != numHops ||
             route.minOuts.length != numHops ||
             route.feeBps.length != numHops) revert InvalidRoute();
+
+        for (uint i = 0; i < numHops; i++) {
+            if (route.feeBps[i] == 0) revert ZeroFeeBps();
+        }
 
         if (loanAmount != route.amountIn) revert InvalidLoanAmount();
         if (route.tokens[0] != loanToken || route.tokens[numHops] != loanToken) revert InvalidRoute();
@@ -238,6 +255,7 @@ contract FlashArbExecutor is
         _handleDodoCallback(sender, baseAmount, quoteAmount, data);
     }
 
+    // ---- DODO callback handler with fee handling ----
     function _handleDodoCallback(address sender, uint256 baseAmount, uint256 quoteAmount, bytes calldata data) internal {
         if (_ctx.provider != LoanProvider.DODO) revert UnauthorizedProvider();
         if (msg.sender != _ctx.loanPool) revert UnauthorizedPool();
@@ -268,91 +286,61 @@ contract FlashArbExecutor is
         _ctx.state = ExecutionState.SWAP_ACTIVE;
         _executeRoute();
 
-        _safeTransfer(IERC20(_ctx.loanToken), msg.sender, borrowedAmount);
+        uint256 fee = _getDodoFee(msg.sender);
+        uint256 minSafetyBuffer = (borrowedAmount * 1e14) / 1e18; // 0.01%
+        uint256 repayAmount;
+        if (fee == 0) {
+            repayAmount = borrowedAmount + minSafetyBuffer;
+        } else {
+            repayAmount = borrowedAmount + fee;
+        }
+        _safeTransfer(IERC20(_ctx.loanToken), msg.sender, repayAmount);
 
         _ctx.state = ExecutionState.COMPLETE;
         _finalize();
     }
 
-    // ---- V3 callbacks (updated to use token path, no staticcalls) ----
+    // ---- Helper to fetch DODO flash loan fee (0 if not available) ----
+    function _getDodoFee(address pool) internal view returns (uint256) {
+        (bool success, bytes memory data) = pool.staticcall(abi.encodeWithSignature("_FLASH_LOAN_FEE_()"));
+        if (!success || data.length < 32) return 0;
+        return abi.decode(data, (uint256));
+    }
+
+    // ---- V3 callbacks ----
     function uniswapV3SwapCallback(int256 amount0Delta, int256 amount1Delta, bytes calldata)
         external override onlyActiveSwap
     {
-        uint hop = _ctx.hop;
-        DexType expectedDex = _ctx.route.dexTypes[hop];
-        if (expectedDex != DexType.UNISWAP_V3) revert InvalidDexTypeForCallback();
-
-        if (_ctx.hopPaid) revert SwapExecutionFailed();
-        _ctx.hopPaid = true;
-
-        address pool = msg.sender;
-        if (pool != _ctx.route.pools[hop]) revert UnauthorizedPool();
-
-        // Determine token0 and token1 from the token path and zeroForOne flag.
-        address tokenIn = _ctx.route.tokens[hop];
-        address tokenOut = _ctx.route.tokens[hop + 1];
-        bool zeroForOne = _ctx.route.zeroForOnes[hop];
-        // If zeroForOne is true, tokenIn is token0, tokenOut is token1; else reversed.
-        (address token0, address token1) = zeroForOne ? (tokenIn, tokenOut) : (tokenOut, tokenIn);
-
-        uint256 amountToPay;
-        address tokenToPay;
-        if (amount0Delta > 0) {
-            tokenToPay = token0;
-            amountToPay = uint256(amount0Delta);
-        } else if (amount1Delta > 0) {
-            tokenToPay = token1;
-            amountToPay = uint256(amount1Delta);
-        } else {
-            revert SwapExecutionFailed();
-        }
-
-        address expectedInputToken = zeroForOne ? token0 : token1;
-        if (tokenToPay != expectedInputToken) revert SwapExecutionFailed();
-
-        _safeTransfer(IERC20(tokenToPay), pool, amountToPay);
+        _handleUniversalV3Callback(amount0Delta, amount1Delta);
     }
 
     function pancakeV3SwapCallback(int256 amount0Delta, int256 amount1Delta, bytes calldata)
         external override onlyActiveSwap
     {
-        uint hop = _ctx.hop;
-        DexType expectedDex = _ctx.route.dexTypes[hop];
-        if (expectedDex != DexType.PANCAKE_V3) revert InvalidDexTypeForCallback();
+        _handleUniversalV3Callback(amount0Delta, amount1Delta);
+    }
 
+    function _handleUniversalV3Callback(int256 amount0Delta, int256 amount1Delta) internal {
         if (_ctx.hopPaid) revert SwapExecutionFailed();
         _ctx.hopPaid = true;
 
         address pool = msg.sender;
-        if (pool != _ctx.route.pools[hop]) revert UnauthorizedPool();
+        if (pool != _ctx.route.pools[_ctx.hop]) revert UnauthorizedPool();
 
-        address tokenIn = _ctx.route.tokens[hop];
-        address tokenOut = _ctx.route.tokens[hop + 1];
-        bool zeroForOne = _ctx.route.zeroForOnes[hop];
+        address tokenIn = _ctx.route.tokens[_ctx.hop];
+        address tokenOut = _ctx.route.tokens[_ctx.hop + 1];
+        bool zeroForOne = _ctx.route.zeroForOnes[_ctx.hop];
         (address token0, address token1) = zeroForOne ? (tokenIn, tokenOut) : (tokenOut, tokenIn);
 
-        uint256 amountToPay;
-        address tokenToPay;
-        if (amount0Delta > 0) {
-            tokenToPay = token0;
-            amountToPay = uint256(amount0Delta);
-        } else if (amount1Delta > 0) {
-            tokenToPay = token1;
-            amountToPay = uint256(amount1Delta);
-        } else {
-            revert SwapExecutionFailed();
-        }
-
-        address expectedInputToken = zeroForOne ? token0 : token1;
-        if (tokenToPay != expectedInputToken) revert SwapExecutionFailed();
+        uint256 amountToPay = amount0Delta > 0 ? uint256(amount0Delta) : uint256(amount1Delta);
+        address tokenToPay = amount0Delta > 0 ? token0 : token1;
 
         _safeTransfer(IERC20(tokenToPay), pool, amountToPay);
     }
 
-    // ---- Internal route execution (no _getPoolInfo calls) ----
+    // ---- Internal route execution ----
     function _executeRoute() internal {
         uint numHops = _ctx.route.pools.length;
-        // Validate endpoints using token path.
         if (_ctx.route.tokens[0] != _ctx.loanToken) revert TokenContinuityFailed();
         if (_ctx.route.tokens[numHops] != _ctx.loanToken) revert TokenContinuityFailed();
 
@@ -361,6 +349,7 @@ contract FlashArbExecutor is
         for (uint i = 0; i < numHops; i++) {
             if (block.timestamp > _ctx.deadline) revert StaleTransaction();
 
+            _ctx.hopPaid = false;
             _ctx.hop = i;
             uint256 amountOut = _swapHop(i, amountIn);
 
@@ -377,14 +366,6 @@ contract FlashArbExecutor is
         address tokenIn = _ctx.route.tokens[hop];
         address tokenOut = _ctx.route.tokens[hop + 1];
 
-        // Continuity check: ensure tokenIn matches previous hop's tokenOut.
-        if (hop > 0) {
-            if (tokenIn != _ctx.route.tokens[hop]) revert TokenContinuityFailed();
-        }
-
-        // Stable pool check for Aerodrome V2 – we still need to know if stable.
-        // We can keep the staticcall because it's only for Aerodrome stable detection.
-        // Alternatively, the solver could pass a flag, but we keep this minimal.
         if (dexType == DexType.AERODROME_V2) {
             if (_isAerodromeStable(pool)) revert UnsupportedPoolType();
         }
@@ -404,7 +385,6 @@ contract FlashArbExecutor is
                 IPancakeV3Pool(pool).swap(address(this), zeroForOne, amountSpecified, sqrtPriceLimitX96, bytes(""));
             }
         } else {
-            // V2 style
             uint256 reserveIn;
             uint256 reserveOut;
 
@@ -416,13 +396,10 @@ contract FlashArbExecutor is
                 (reserveIn, reserveOut) = zeroForOne ? (uint256(r0), uint256(r1)) : (uint256(r1), uint256(r0));
             }
 
-            // Use fee passed in RouteData, with fallback to 30 if somehow zero.
-            uint256 feeBps = _ctx.route.feeBps[hop];
-            if (feeBps == 0) feeBps = 30;
-
+            uint256 actualFeeBps = _getV2Fee(pool, dexType);
             uint256 numerator = mulDiv(reserveOut, amountIn, 1);
-            numerator = mulDiv(numerator, (10000 - feeBps), 1);
-            uint256 denominator = mulDiv(reserveIn, 10000, 1) + mulDiv(amountIn, (10000 - feeBps), 1);
+            numerator = mulDiv(numerator, (10000 - actualFeeBps), 1);
+            uint256 denominator = mulDiv(reserveIn, 10000, 1) + mulDiv(amountIn, (10000 - actualFeeBps), 1);
             uint256 amountOut = numerator / denominator;
 
             _safeTransfer(IERC20(tokenIn), pool, amountIn);
@@ -452,6 +429,7 @@ contract FlashArbExecutor is
 
     // ---- Safe multiplication/division ----
     function mulDiv(uint256 a, uint256 b, uint256 denominator) internal pure returns (uint256 result) {
+        require(denominator > 0, "denominator zero");
         uint256 prod0;
         uint256 prod1;
         assembly {
@@ -460,7 +438,6 @@ contract FlashArbExecutor is
             prod1 := sub(sub(mm, prod0), lt(mm, prod0))
         }
         if (prod1 == 0) {
-            require(denominator > 0);
             assembly {
                 result := div(prod0, denominator)
             }
@@ -473,12 +450,24 @@ contract FlashArbExecutor is
         return result;
     }
 
-    // ---- Aerodrome stable detection (kept minimal) ----
+    // ---- Aerodrome stable detection ----
     function _isAerodromeStable(address pool) internal view returns (bool) {
         (bool success, bytes memory data) = pool.staticcall(abi.encodeWithSignature("stable()"));
         if (!success) return false;
         if (data.length < 32) return false;
         return abi.decode(data, (bool));
+    }
+
+    // ---- Fetch actual V2 pool fee (in bps) ----
+    function _getV2Fee(address pool, DexType dexType) internal view returns (uint256) {
+        if (dexType == DexType.AERODROME_V2 || dexType == DexType.ALIENBASE_V2) {
+            (bool success, bytes memory data) = pool.staticcall(abi.encodeWithSignature("fee()"));
+            if (success && data.length >= 32) {
+                uint24 feePips = uint24(abi.decode(data, (uint24)));
+                return feePips / 100; // convert pips to basis points
+            }
+        }
+        return 30;
     }
 
     function _checkProfit() internal view returns (uint256 net) {
