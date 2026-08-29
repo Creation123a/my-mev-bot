@@ -25,7 +25,7 @@ import (
 	"my-mev-bot/Bot/Execution"
 	"my-mev-bot/Bot/Solver"
 	"my-mev-bot/Bot/State"
-	"my-mev-bot/Bot/Types"
+botTypes	"my-mev-bot/Bot/Types"
 )
 
 // =============================================================================
@@ -183,7 +183,7 @@ type Tracker struct {
 	client          *ethclient.Client
 	gevm            *execution.GEVMSimulator
 	matrix          *state.Matrix
-	executionChan   chan<- *types.ExecutionPayload
+	executionChan   chan<- *botTypes.ExecutionPayload
 	payloadPool     *sync.Pool
 	priorityFee     uint64
 	executorAddress common.Address
@@ -211,7 +211,7 @@ func NewTracker(
 	client *ethclient.Client,
 	gevm *execution.GEVMSimulator,
 	matrix *state.Matrix,
-	executionChan chan<- *types.ExecutionPayload,
+	executionChan chan<- *botTypes.ExecutionPayload,
 	payloadPool *sync.Pool,
 	priorityFee uint64,
 	cfg *config.Config,
@@ -289,20 +289,18 @@ func NewTracker(
 // SetWSURL sets the WebSocket endpoint.
 func (t *Tracker) SetWSURL(url string) { t.wsURL = url }
 
-func (t *Tracker) getFeeForPair(tokenA, tokenB common.Address) uint24 {
+func (t *Tracker) getFeeForPair(tokenA, tokenB common.Address) uint32 {
     pools := t.matrix.GetPoolsForPair(tokenA, tokenB)
     for _, p := range pools {
-        if p.DexType == types.DexUniswapV3 || p.DexType == types.DexPancakeV3 {
-            // Prefer raw Uniswap fee if available, otherwise convert carefully
-            if p.FeeBps >= 100 && p.FeeBps <= 10000 { // already in hundredths of a bp
-                return uint24(p.FeeBps)
+        if p.DexType == botTypes.DexUniswapV3 || p.DexType == botTypes.DexPancakeV3 {
+            if p.FeeBps >= 100 && p.FeeBps <= 10000 {
+                return uint32(p.FeeBps)
             }
-            return uint24(p.FeeBps * 100) // plain bps → hundredths
+            return uint32(p.FeeBps * 100)
         }
     }
-    return 3000 // fallback
+    return 3000
 }
-
 // SetGEVM injects the simulator for pre‑flight validation.
 func (t *Tracker) SetGEVM(gevm *execution.GEVMSimulator) { t.gevm = gevm }
 
@@ -597,7 +595,7 @@ func (t *Tracker) updateAavePosition(ctx context.Context, user common.Address) {
 			}
 		}
 		if res.VariableDebt.Sign() > 0 || res.StableDebt.Sign() > 0 {
-			debtAmount = new(big.Int).Add(&res.VariableDebt, &res.StableDebt)
+			debtAmount = new(big.Int).Add(res.VariableDebt, res.StableDebt)
 			totalDebtBase.Add(&totalDebtBase, debtAmount)
 			if debtAsset == (common.Address{}) {
 				debtAsset = res.UnderlyingAsset
@@ -1291,7 +1289,7 @@ if estimatedProfit < t.cfg.LiquidationMinProfitUSD {
 	}
 
 	// Build calldata
-fee := t.getFeeForPair(pos.CollateralAsset, pos.DebtAsset)
+fee := t.getFeeForPair(pos.CollateralAsset, pos.DebtAsset) // now uint32
 calldata, err := executorABI.Pack("executeLiquidation",
     uint8(protocol),
     pos.DebtAsset,
@@ -1304,7 +1302,7 @@ calldata, err := executorABI.Pack("executeLiquidation",
 		return
 	}
 
-	payload := t.payloadPool.Get().(*types.ExecutionPayload)
+	payload := t.payloadPool.Get().(*botTypes.ExecutionPayload)
 	payload.Reset()
 	payload.TargetExecutor = t.executorAddress
 	payload.BorrowedToken = pos.DebtAsset
@@ -1321,7 +1319,7 @@ calldata, err := executorABI.Pack("executeLiquidation",
 
 	// GEVM simulation
 	if t.gevm != nil {
-		simPayload := &types.ExecutionPayload{
+		simPayload := &botTypes.ExecutionPayload{
 			TargetExecutor: t.executorAddress,
 			BorrowedToken:  pos.DebtAsset,
 			Calldata:       calldata,
