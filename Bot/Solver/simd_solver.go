@@ -299,14 +299,14 @@ func EvaluateEvent(log *types.SwapLog, matrix *state.Matrix, cfg *config.Config)
 	if isAnchorA && isAnchorB {
 		// no direct opportunity
 	} else if isAnchorA && !isAnchorB {
-		enqueue(func() *types.RouteCandidate { return buildRoundTrip2Hop(tokenA, tokenB, matrix, cfg, &priceCache) })
+		enqueue(func() *types.RouteCandidate { return BuildRoundTrip2Hop(tokenA, tokenB, matrix, cfg, &priceCache) })
 	} else if !isAnchorA && isAnchorB {
-		enqueue(func() *types.RouteCandidate { return buildRoundTrip2Hop(tokenB, tokenA, matrix, cfg, &priceCache) })
+		enqueue(func() *types.RouteCandidate { return BuildRoundTrip2Hop(tokenB, tokenA, matrix, cfg, &priceCache) })
 	} else {
 		for _, anchor := range anchors {
 			anchor := anchor
-			enqueue(func() *types.RouteCandidate { return buildRoundTrip3Hop(anchor, tokenA, tokenB, matrix, cfg, &priceCache) })
-			enqueue(func() *types.RouteCandidate { return buildRoundTrip3Hop(anchor, tokenB, tokenA, matrix, cfg, &priceCache) })
+			enqueue(func() *types.RouteCandidate { return BuildRoundTrip3Hop(anchor, tokenA, tokenB, matrix, cfg, &priceCache) })
+			enqueue(func() *types.RouteCandidate { return BuildRoundTrip3Hop(anchor, tokenB, tokenA, matrix, cfg, &priceCache) })
 		}
 	}
 
