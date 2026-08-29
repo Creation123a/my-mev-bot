@@ -141,3 +141,76 @@ interface IUniswapV2Router {
         view
         returns (uint256[] memory amounts);
 }
+// =============================================================================
+// LIQUIDATION PROTOCOL INTERFACES (Append to your existing Interfaces.txt)
+// =============================================================================
+
+// ---- Aave V3 ----
+interface IAavePool {
+    function liquidationCall(
+        address collateralAsset,
+        address debtAsset,
+        address user,
+        uint256 debtToCover,
+        bool receiveAToken
+    ) external returns (uint256, string memory);
+}
+
+// ---- Compound III ----
+interface IComet {
+    function absorb(address absorber, address[] calldata accounts) external;
+    function buyCollateral(address asset, uint256 minAmount, uint256 baseAmount, address recipient) external;
+    function getBorrowBalance(address account) external view returns (uint256);
+    function getCollateralBalance(address account, address asset) external view returns (uint256);
+}
+
+// ---- Morpho Blue ----
+interface IMorpho {
+    struct MarketParams {
+        address loanToken;
+        address collateralToken;
+        address oracle;
+        address irm;
+        uint256 lltv;
+    }
+    function liquidate(
+        MarketParams memory marketParams,
+        address borrower,
+        uint256 seizedAssets,
+        uint256 maxRepayAmount,
+        bytes calldata data
+    ) external;
+}
+
+// ---- Exactly Protocol ----
+interface IExactlyMarket {
+    function asset() external view returns (address);
+    function liquidate(address borrower, uint256 maxAssets, address seizeMarket) external returns (uint256);
+}
+
+// ---- Moonwell ----
+interface IMoonwellMToken {
+    function underlying() external view returns (address);
+    function liquidateBorrow(address borrower, uint256 repayAmount, address mTokenCollateral) external returns (uint256);
+    function getAccountSnapshot(address account) external view returns (uint256, uint256, uint256);
+}
+
+// ---- Ionic ----
+interface IIonicPool {
+    function liquidate(address borrower, address collateral, uint256 repayAmount) external;
+}
+
+// ---- Uniswap V3 / Aerodrome Swap Router ----
+interface ISwapRouter {
+    struct ExactInputSingleParams {
+        address tokenIn;
+        address tokenOut;
+        uint24 fee;
+        address recipient;
+        uint256 deadline;
+        uint256 amountIn;
+        uint256 amountOutMinimum;
+        uint160 sqrtPriceLimitX96;
+    }
+    function exactInputSingle(ExactInputSingleParams calldata params) external payable returns (uint256 amountOut);
+}
