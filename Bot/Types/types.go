@@ -197,8 +197,8 @@ p.TickSpacing = 0
 }
 // SetTickData stores the tick bitmap, liquidity net, and tick spacing atomically.
 func (p *PoolState) SetTickData(bitmap map[int32]*big.Int, liquidityNet map[int32]*big.Int, tickSpacing int32) {
-    p.tickMu.Lock()
-    defer p.tickMu.Unlock()
+    p.TickMu.Lock()
+    defer p.TickMu.Unlock()
     p.TickBitmap = bitmap
     p.LiquidityNet = liquidityNet
     p.TickSpacing = tickSpacing
@@ -217,8 +217,8 @@ func (p *PoolState) CopySqrtAndLiquidity(sqrtDest, liqDest *big.Int) {
 }
 // GetTickBitmapWord returns the 256‑bit word at the given word index.
 func (p *PoolState) GetTickBitmapWord(wordIndex int32) *big.Int {
-    p.tickMu.RLock()
-    defer p.tickMu.RUnlock()
+    p.TickMu.RLock()
+    defer p.TickMu.RUnlock()
     if p.TickBitmap == nil {
         return nil
     }
@@ -227,8 +227,8 @@ func (p *PoolState) GetTickBitmapWord(wordIndex int32) *big.Int {
 
 // GetLiquidityNet returns the net liquidity change at a tick.
 func (p *PoolState) GetLiquidityNet(tick int32) *big.Int {
-    p.tickMu.RLock()
-    defer p.tickMu.RUnlock()
+    p.TickMu.RLock()
+    defer p.TickMu.RUnlock()
     if p.LiquidityNet == nil {
         return nil
     }
