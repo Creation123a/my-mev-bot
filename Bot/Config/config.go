@@ -37,6 +37,30 @@ type Config struct {
 	// CPU optimization settings
 	EnableCPUPinning bool   // Enable CPU core pinning for workers
 	WorkerCoreIDs    []int  // Core IDs for workers (must have at least 3 distinct cores if pinning is enabled)
+
+	// ===== NEW: Bonding curve arbitrage =====
+	BondingExecutorAddress string  // Address of the BondingArbitrageExecutor contract
+	BondingCoreID          int     // Dedicated CPU core for bonding tracker (-1 = auto)
+	BondingPollIntervalMs  int     // Polling interval in milliseconds for bonding curve checks (default 500)
+
+	// ===== NEW: Speculative multiverse =====
+	SpeculativeScenarios int     // Number of speculative scenarios to pre‑compute (default 5)
+	MemoryThresholdGB    float64 // Heap memory threshold in GB to trigger manual GC (default 2.0)
+
+
+	// ===== NEW: Liquidation sniper =====
+	LiquidationEnabled         bool
+	AavePoolAddress            string
+	CompoundCometAddress       string
+	MorphoBlueAddress          string
+	ExactlyAuditorAddress      string
+	MoonwellMTokenAddress      string
+	IonicPoolAddress           string
+	SwapRouterAddress          string
+	LiquidationExecutorAddress string // FlashLiquidationExecutor contract
+	LiquidationCoreID          int
+	LiquidationPollIntervalMs  int
+	LiquidationMinProfitUSD    float64
 }
 
 // LoadConfig loads environment variables from .env (if present) and validates them.
@@ -239,15 +263,12 @@ func LoadConfig() (*Config, error) {
 		if len(workerCoreIDs) == 0 {
 			workerCoreIDs = []int{2, 3, 4}
 		}
-		// Ensure we have at least 3 entries.
 		if len(workerCoreIDs) < 3 {
 			return nil, fmt.Errorf("WORKER_CORE_IDS must contain at least 3 entries when ENABLE_CPU_PINNING is true (got %d)", len(workerCoreIDs))
 		}
-		// Validate that the first three core IDs are distinct.
 		if workerCoreIDs[0] == workerCoreIDs[1] || workerCoreIDs[0] == workerCoreIDs[2] || workerCoreIDs[1] == workerCoreIDs[2] {
 			return nil, fmt.Errorf("the first three WORKER_CORE_IDS must be distinct when ENABLE_CPU_PINNING is true")
 		}
-		// Also ensure overall distinctness (optional but safe).
 		uniqueCores := make(map[int]struct{})
 		for _, c := range workerCoreIDs {
 			uniqueCores[c] = struct{}{}
@@ -255,6 +276,129 @@ func LoadConfig() (*Config, error) {
 		if len(uniqueCores) < 3 {
 			return nil, fmt.Errorf("WORKER_CORE_IDS must contain at least 3 distinct core IDs when ENABLE_CPU_PINNING is true")
 		}
+	}
+
+	// ===== NEW: Bonding curve arbitrage settings =====
+	bondingExecutorAddress := os.Getenv("BONDING_EXECUTOR_ADDRESS")
+	if bondingExecutorAddress != "" && !common.IsHexAddress(bondingExecutorAddress) {
+		return nil, fmt.Errorf("BONDING_EXECUTOR_ADDRESS is not a valid Ethereum address: %s", bondingExecutorAddress)
+	}
+	if bondingExecutorAddress != "" && common.HexToAddress(bondingExecutorAddress) == (common.Address{}) {
+		return nil, fmt.Errorf("BONDING_EXECUTOR_ADDRESS must not be the zero address")
+	}
+
+	bondingCoreID := -1
+	if val := os.Getenv("BONDING_CORE_ID"); val != "" {
+		parsed, err := strconv.Atoi(val)
+		if err != nil {
+			return nil, fmt.Errorf("BONDING_CORE_ID must be an integer: %v", err)
+		}
+		if parsed < -1 {
+			return nil, fmt.Errorf("BONDING_CORE_ID must be >= -1")
+		}
+		bondingCoreID = parsed
+	}
+
+	bondingPollIntervalMs := 500
+	if val := os.Getenv("BONDING_POLL_INTERVAL_MS"); val != "" {
+		parsed, err := strconv.Atoi(val)
+		if err != nil {
+			return nil, fmt.Errorf("BONDING_POLL_INTERVAL_MS must be an integer: %v", err)
+		}
+		if parsed <= 0 {
+			return nil, fmt.Errorf("BONDING_POLL_INTERVAL_MS must be > 0")
+		}
+		bondingPollIntervalMs = parsed
+	}
+
+// ===== NEW: Liquidation sniper settings =====
+liquidationEnabled := os.Getenv("LIQUIDATION_ENABLED") == "true"
+
+aavePoolAddress := os.Getenv("AAVE_POOL_ADDRESS")
+compoundCometAddress := os.Getenv("COMPOUND_COMET_ADDRESS")
+morphoBlueAddress := os.Getenv("MORPHO_BLUE_ADDRESS")
+exactlyAuditorAddress := os.Getenv("EXACTLY_AUDITOR_ADDRESS")
+moonwellMTokenAddress := os.Getenv("MOONWELL_MTOKEN_ADDRESS")
+ionicPoolAddress := os.Getenv("IONIC_POOL_ADDRESS")
+swapRouterAddress := os.Getenv("SWAP_ROUTER_ADDRESS")
+liquidationExecutorAddress := os.Getenv("LIQUIDATION_EXECUTOR_ADDRESS")
+
+if liquidationEnabled {
+	if aavePoolAddress == "" || compoundCometAddress == "" ||
+		morphoBlueAddress == "" || exactlyAuditorAddress == "" ||
+		moonwellMTokenAddress == "" || ionicPoolAddress == "" {
+		return nil, fmt.Errorf("all protocol addresses are required when LIQUIDATION_ENABLED is true")
+	}
+	if swapRouterAddress == "" {
+		return nil, fmt.Errorf("SWAP_ROUTER_ADDRESS is required for liquidation")
+	}
+	if liquidationExecutorAddress == "" {
+		return nil, fmt.Errorf("LIQUIDATION_EXECUTOR_ADDRESS is required")
+	}
+	if !common.IsHexAddress(liquidationExecutorAddress) {
+		return nil, fmt.Errorf("LIQUIDATION_EXECUTOR_ADDRESS is not valid")
+	}
+}
+
+liquidationCoreID := -1
+if val := os.Getenv("LIQUIDATION_CORE_ID"); val != "" {
+	parsed, err := strconv.Atoi(val)
+	if err != nil {
+		return nil, fmt.Errorf("LIQUIDATION_CORE_ID must be an integer: %v", err)
+	}
+	if parsed < -1 {
+		return nil, fmt.Errorf("LIQUIDATION_CORE_ID must be >= -1")
+	}
+	liquidationCoreID = parsed
+}
+
+liquidationPollIntervalMs := 5000
+if val := os.Getenv("LIQUIDATION_POLL_INTERVAL_MS"); val != "" {
+	parsed, err := strconv.Atoi(val)
+	if err != nil {
+		return nil, fmt.Errorf("LIQUIDATION_POLL_INTERVAL_MS must be an integer: %v", err)
+	}
+	if parsed <= 0 {
+		return nil, fmt.Errorf("LIQUIDATION_POLL_INTERVAL_MS must be > 0")
+	}
+	liquidationPollIntervalMs = parsed
+}
+
+liquidationMinProfitUSD := 1.0
+if val := os.Getenv("LIQUIDATION_MIN_PROFIT_USD"); val != "" {
+	parsed, err := strconv.ParseFloat(val, 64)
+	if err != nil {
+		return nil, fmt.Errorf("LIQUIDATION_MIN_PROFIT_USD must be a float: %v", err)
+	}
+	if parsed <= 0 {
+		return nil, fmt.Errorf("LIQUIDATION_MIN_PROFIT_USD must be > 0")
+	}
+	liquidationMinProfitUSD = parsed
+}
+
+	// ===== NEW: Speculative multiverse settings =====
+	speculativeScenarios := 5
+	if val := os.Getenv("SPECULATIVE_SCENARIOS"); val != "" {
+		parsed, err := strconv.Atoi(val)
+		if err != nil {
+			return nil, fmt.Errorf("SPECULATIVE_SCENARIOS must be an integer: %v", err)
+		}
+		if parsed <= 0 || parsed > 20 {
+			return nil, fmt.Errorf("SPECULATIVE_SCENARIOS must be between 1 and 20")
+		}
+		speculativeScenarios = parsed
+	}
+
+	memoryThresholdGB := 2.0
+	if val := os.Getenv("MEMORY_THRESHOLD_GB"); val != "" {
+		parsed, err := strconv.ParseFloat(val, 64)
+		if err != nil {
+			return nil, fmt.Errorf("MEMORY_THRESHOLD_GB must be a float: %v", err)
+		}
+		if parsed <= 0 {
+			return nil, fmt.Errorf("MEMORY_THRESHOLD_GB must be > 0")
+		}
+		memoryThresholdGB = parsed
 	}
 
 	cfg := &Config{
@@ -274,6 +418,26 @@ func LoadConfig() (*Config, error) {
 		MaxReplaceAttempts:  maxReplaceAttempts,
 		EnableCPUPinning:    enableCPUPinning,
 		WorkerCoreIDs:       workerCoreIDs,
+
+		// New fields
+		BondingExecutorAddress: bondingExecutorAddress,
+		BondingCoreID:          bondingCoreID,
+		BondingPollIntervalMs:  bondingPollIntervalMs,
+		SpeculativeScenarios:   speculativeScenarios,
+		MemoryThresholdGB:      memoryThresholdGB,
+		// Liquidation fields
+	LiquidationEnabled:         liquidationEnabled,
+	AavePoolAddress:            aavePoolAddress,
+	CompoundCometAddress:       compoundCometAddress,
+	MorphoBlueAddress:          morphoBlueAddress,
+	ExactlyAuditorAddress:      exactlyAuditorAddress,
+	MoonwellMTokenAddress:      moonwellMTokenAddress,
+	IonicPoolAddress:           ionicPoolAddress,
+	SwapRouterAddress:          swapRouterAddress,
+	LiquidationExecutorAddress: liquidationExecutorAddress,
+	LiquidationCoreID:          liquidationCoreID,
+	LiquidationPollIntervalMs:  liquidationPollIntervalMs,
+	LiquidationMinProfitUSD:    liquidationMinProfitUSD,
 	}
 
 	return cfg, nil
