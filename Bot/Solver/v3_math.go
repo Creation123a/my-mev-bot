@@ -266,9 +266,9 @@ func (c *V3Calculator) ComputeSwap(pool *types.PoolState, tokenIn, tokenOut comm
 	}
 
 	// Check if we have tick data for exact simulation.
-	pool.tickMu.RLock()
-	hasTickData := pool.TickBitmap != nil && len(pool.TickBitmap) > 0 && pool.LiquidityNet != nil && len(pool.LiquidityNet) > 0
-	pool.tickMu.RUnlock()
+	pool.TickMu.RLock()
+hasTickData := pool.TickBitmap != nil && len(pool.TickBitmap) > 0 && pool.LiquidityNet != nil && len(pool.LiquidityNet) > 0
+pool.TickMu.RUnlock()
 
 	if hasTickData {
 		return c.computeSwapExact(pool, amountIn, zeroForOne, result)
@@ -459,7 +459,7 @@ func (c *V3Calculator) getNextInitializedTick(pool *types.PoolState, tick int32,
             if w < wordIndex { startBit = 255 }
             if startBit < 0 { startBit = 0 } // handle negative
             for b := startBit; b >= 0; b-- {
-                if word.Bit(b) == 1 {
+if word.Bit(int(b)) == 1 {
                     tickFound := int32(w*256 + b)
                     if tickFound >= tick { continue }
                     return tickFound, true
@@ -478,7 +478,7 @@ func (c *V3Calculator) getNextInitializedTick(pool *types.PoolState, tick int32,
             startBit := bitOffset + 1
             if w > wordIndex { startBit = 0 }
             for b := startBit; b < 256; b++ {
-                if word.Bit(b) == 1 {
+if word.Bit(int(b)) == 1 {
                     tickFound := int32(w*256 + b)
                     if tickFound <= tick { continue }
                     return tickFound, true
@@ -499,7 +499,7 @@ func (c *V3Calculator) getAmount0Delta(sqrtPriceA, sqrtPriceB *big.Int, liquidit
 		diff.Neg(diff)
 	}
 	num := new(big.Int).Mul(liquidity, diff)
-	num.Mul(num, new(big.Int).SetUint64(1<<96))
+num.Mul(num, new(big.Int).Lsh(big.NewInt(1), 96))
 	den := new(big.Int).Mul(sqrtPriceA, sqrtPriceB)
 	res := new(big.Int).Div(num, den)
 	if roundUp && res.Sign() > 0 {
@@ -516,7 +516,7 @@ func (c *V3Calculator) getAmount1Delta(sqrtPriceA, sqrtPriceB *big.Int, liquidit
 		diff.Neg(diff)
 	}
 	num := new(big.Int).Mul(liquidity, diff)
-	shift := new(big.Int).SetUint64(1 << 96)
+	shift := new(big.Int).Lsh(big.NewInt(1), 96)
 	res := new(big.Int).Div(num, shift)
 	if roundUp && res.Sign() > 0 {
 		if new(big.Int).Mod(num, shift).Sign() > 0 {
