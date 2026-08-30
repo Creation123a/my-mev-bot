@@ -385,8 +385,9 @@ if tokenAddr == (common.Address{}) {
         return nil, false
     }
     remaining := new(big.Int).SetBytes(vLog.Data[0:32])
-    // 1e21 is too large for int64 – use SetString
-    threshold := new(big.Int).SetString("1000000000000000000000", 10)
+    // 1e21 is too large for int64 – parse from string
+    threshold := new(big.Int)
+    threshold, _ = threshold.SetString("1000000000000000000000", 10)
     if remaining.Cmp(threshold) < 0 {
         return &BondingCandidate{
             TokenAddress:    tokenAddr,
