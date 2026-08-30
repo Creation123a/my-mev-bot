@@ -35,7 +35,7 @@ import (
 	"my-mev-bot/Bot/Solver"
 	"my-mev-bot/Bot/State"
 	"my-mev-bot/Bot/Types"
-	"my-mev-bot/Bot/Liquidation"
+	//"my-mev-bot/Bot/Liquidation"
 )
 
 const (
@@ -580,10 +580,10 @@ go func() {
 	// ===== 4. Start Memory Guardian (removed – no longer needed) =====
 
 	// ===== 5. Start Speculative Multiverse Seeder (background) =====
-	go func() {
+	/*go func() {
 		defer recoverPanic("Speculative seeder")
 		speculativeSeeder(ctx, matrix, lru, cfg)
-	}()
+	}()*/
 
 	// ===== 6. Start Bonding Tracker =====
 	bondingExecutor := common.HexToAddress(cfg.BondingExecutorAddress)
@@ -624,7 +624,7 @@ go func() {
 		bondingTracker.Run(ctx)
 	}()
 // ===== 7. Start Liquidation Tracker =====
-if cfg.LiquidationEnabled {
+/*if cfg.LiquidationEnabled {
     liquidationTracker := liquidation.NewTracker(
         ethClient,
         gevm,             // pass GEVM for simulation
@@ -653,7 +653,7 @@ liquidationTracker.SetWSURL(cfg.BaseWSRPC)
         defer wg.Done()
         liquidationTracker.Run(ctx)
     }()
-}
+}*/
 	// ---- Worker1 ----
 	wg.Add(1)
 	go func() {
