@@ -29,7 +29,7 @@ import (
 	"my-mev-bot/Bot/Config"
 	"my-mev-bot/Bot/Dashboard"
 	"my-mev-bot/Bot/Execution"
-	//"my-mev-bot/Bot/Gatekeeper"
+	"my-mev-bot/Bot/Gatekeeper"
 	"my-mev-bot/Bot/Ingestion"
 	"my-mev-bot/Bot/Predictive"
 	"my-mev-bot/Bot/Solver"
