@@ -498,7 +498,7 @@ if !ok || tokenPrice <= 0 {
 
 	// ---- Channels ----
 	eventChan := make(chan *types.SwapLog, eventChanSize)
-	//candidateChan := make(chan *types.RouteCandidate, candidateChanSize)
+	/*candidateChan := make(chan *types.RouteCandidate, candidateChanSize)*/
 	executionChan := make(chan *types.ExecutionPayload, executionChanSize)
 
 	solver.StartL1FeeUpdater(ethClient, ctx)
@@ -662,7 +662,7 @@ liquidationTracker.SetWSURL(cfg.BaseWSRPC)
 			pinToCore(cores[0])
 		}
 		defer wg.Done()
-		worker1(ctx, eventChan, candidateChan, executionChan, matrix, blacklist, lru, anchorSet, cfg, gatekeeper,bondingTracker, ethClient)
+		worker1(ctx, eventChan, executionChan, matrix, blacklist, lru, anchorSet, cfg, gatekeeper,bondingTracker, ethClient)
 	}()
 
 	// ---- Worker2 ----
