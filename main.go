@@ -886,7 +886,7 @@ func seedMatrixFromRecentBlocks(client *ethclient.Client, gk *gatekeeper.Gatekee
 func worker1(
 	ctx context.Context,
 	eventChan <-chan *types.SwapLog,
-	candidateChan chan<- *types.RouteCandidate,
+	/*candidateChan chan<- *types.RouteCandidate,*/
 	executionChan chan<- *types.ExecutionPayload,
 	matrix *state.Matrix,
 	blacklist *state.Blacklist,
