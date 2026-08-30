@@ -1004,8 +1004,8 @@ if matrix.IsReorg(swapLog.BlockNumber, blockHash) {
 			}
 			lastSwapLog = copyLog
 			lastLogMu.Unlock()
-
-			candidates := solver.EvaluateEvent(swapLog, matrix, cfg)
+// Only for bonding curve arb 
+			/*candidates := solver.EvaluateEvent(swapLog, matrix, cfg)
 
 			candidateCount = 0
 			for _, cand := range candidates {
@@ -1034,7 +1034,7 @@ if matrix.IsReorg(swapLog.BlockNumber, blockHash) {
 				case candidateChan <- localCandidates[i]:
 				default:
 				}
-			}
+			}*/
 
 			// Update LRU cache with new tokens
 			tokensToTrack := []common.Address{swapLog.TokenIn, swapLog.TokenOut}
