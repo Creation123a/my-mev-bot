@@ -29,7 +29,7 @@ import (
 	"my-mev-bot/Bot/Config"
 	"my-mev-bot/Bot/Dashboard"
 	"my-mev-bot/Bot/Execution"
-	"my-mev-bot/Bot/Gatekeeper"
+	//"my-mev-bot/Bot/Gatekeeper"
 	"my-mev-bot/Bot/Ingestion"
 	"my-mev-bot/Bot/Predictive"
 	"my-mev-bot/Bot/Solver"
@@ -498,7 +498,7 @@ if !ok || tokenPrice <= 0 {
 
 	// ---- Channels ----
 	eventChan := make(chan *types.SwapLog, eventChanSize)
-	candidateChan := make(chan *types.RouteCandidate, candidateChanSize)
+	//candidateChan := make(chan *types.RouteCandidate, candidateChanSize)
 	executionChan := make(chan *types.ExecutionPayload, executionChanSize)
 
 	solver.StartL1FeeUpdater(ethClient, ctx)
@@ -897,8 +897,8 @@ func worker1(
 	bondingTracker *bonding.Tracker,
 	ethClient *ethclient.Client,
 ) {
-	var localCandidates [maxCandidatesPerEvent]*types.RouteCandidate
-	candidateCount := 0
+	/*var localCandidates [maxCandidatesPerEvent]*types.RouteCandidate
+	candidateCount := 0*/
 
 	for {
 		select {
@@ -1039,19 +1039,15 @@ if matrix.IsReorg(swapLog.BlockNumber, blockHash) {
 				default:
 				}
 			}*/
-
+/* Only for bonding curve arb */
 			// Update LRU cache with new tokens
-			tokensToTrack := []common.Address{swapLog.TokenIn, swapLog.TokenOut}
-			for _, cand := range candidates {
-				for _, tok := range cand.Tokens {
-					tokensToTrack = append(tokensToTrack, tok)
-				}
-			}
-			for _, tok := range tokensToTrack {
-				if tok != (common.Address{}) && !anchorSet[tok] {
-					lru.Put(tok)
-				}
-			}
+tokensToTrack := []common.Address{swapLog.TokenIn, swapLog.TokenOut}
+// We don't process arbitrage candidates during bonding-only phase
+for _, tok := range tokensToTrack {
+    if tok != (common.Address{}) && !anchorSet[tok] {
+        lru.Put(tok)
+    }
+}
 			matrix.UpdateLastBlock(swapLog.BlockNumber, blockHash)
 			ingestion.PutSwapLog(swapLog)
 		}
