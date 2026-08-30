@@ -16,7 +16,7 @@ import (
 	"github.com/ethereum/go-ethereum/accounts/abi"
 	"github.com/ethereum/go-ethereum/accounts/abi/bind"
 	"github.com/ethereum/go-ethereum/common"
-	"github.com/ethereum/go-ethereum/core/types"
+	gethTypes "github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/ethclient"
 	"github.com/gorilla/websocket"
@@ -154,7 +154,7 @@ type Tracker struct {
 	wsConn   *websocket.Conn
 	wsMu     sync.Mutex
 	wsClosed atomic.Bool
-	logChan  chan types.Log
+	logChan  chan gethTypes.Log
 	ctx      context.Context
 	cancel   context.CancelFunc
 }
@@ -237,7 +237,7 @@ func NewTracker(
 		topicMap:        topicMap,
 		candidates:      make(map[common.Address]*BondingCandidate),
 		knownTokens:     make(map[common.Address]struct{}),
-		logChan:         make(chan types.Log, 512),
+		logChan:         make(chan gethTypes.Log, 512),
 	}
 }
 
@@ -265,7 +265,7 @@ func Is999Percent(current, target *big.Int) bool {
 // parseLog – Decodes log according to platform's layout
 // =============================================================================
 
-func (t *Tracker) parseLog(vLog types.Log) (*BondingCandidate, bool) {
+func (t *Tracker) parseLog(vLog gethTypes.Log) (*BondingCandidate, bool) {
 	if len(vLog.Topics) == 0 {
 		return nil, false
 	}
@@ -422,7 +422,7 @@ if tokenAddr == (common.Address{}) {
 // handleLog – processes a parsed log and triggers arbitrage
 // =============================================================================
 
-func (t *Tracker) handleLog(vLog types.Log) {
+func (t *Tracker) handleLog(vLog gethTypes.Log) {
 	if len(vLog.Topics) == 0 {
 		return
 	}
@@ -703,7 +703,7 @@ func (t *Tracker) runWebSocketSubscription(ctx context.Context) {
 				if err := json.Unmarshal(msg.Params, &subData); err != nil {
 					continue
 				}
-				var vLog types.Log
+				var vLog gethTypes.Log
 				if err := json.Unmarshal(subData.Result, &vLog); err != nil {
 					continue
 				}
