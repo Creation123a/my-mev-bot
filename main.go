@@ -237,8 +237,12 @@ go func() {
 	}
 	// In main.go, after loanProviders and before WarmUpAddresses:
 bondingFactories := []common.Address{
-    common.HexToAddress("0xe85a59c628f7d27878aceb4bf3b35733630083a9"), // Clanker V4
     common.HexToAddress("0x1A540088125d00dD3990f9dA45CA0859af4d3B01"), // Virtuals
+    common.HexToAddress("0xC68007C16088d228EF0DF92dB6A9FA19F57b9A23"), // MoltMoon
+    common.HexToAddress("0x7706d3389A197D667793Fe4991A5406085FFdfD6"), // Base.meme
+    common.HexToAddress("0x5C0Ce7E1df7bE75E4De827E6A94EFE6F0764D00b"), // ClawLaunch
+    common.HexToAddress("0x3c267B8053683A3FeE9dbDEAA65e06a3e6A6133B"), // Pump.fun
+    common.HexToAddress("0x8FA4b802779BBe63ffE72b947f9FBE676A3D801a"), // Thryx
 }
 allAddrs = append(allAddrs, bondingFactories...)
 allAddrs = append(allAddrs, common.HexToAddress(cfg.BondingExecutorAddress))
@@ -587,24 +591,17 @@ go func() {
 
 	// ===== 6. Start Bonding Tracker =====
 	bondingExecutor := common.HexToAddress(cfg.BondingExecutorAddress)
-	bondingTracker := bonding.NewTracker(
-		ethClient,
-		blacklist,
-		dexCache,
-		memeCache,
-		[]common.Address{
-			common.HexToAddress("0xe85a59c628f7d27878aceb4bf3b35733630083a9"),
-			common.HexToAddress("0x1A540088125d00dD3990f9dA45CA0859af4d3B01"),
-		},
-		bondingExecutor,
-		uint64(cfg.MaxPriorityFeeGwei*1e9),
-		executionChan,
-		matrix,
-		&payloadPool,
-		cfg.BondingPollIntervalMs,
-	)
-	bondingTracker.SetWSURL(cfg.BaseWSRPC) // <-- Added
-	bondingTracker.SetGEVM(gevm)           // <-- Added
+bondingTracker := bonding.NewTracker(
+    ethClient,
+    gevm,
+    matrix,
+    executionChan,
+    &payloadPool,
+    bondingExecutor,
+    uint64(cfg.MaxPriorityFeeGwei*1e9),
+)
+bondingTracker.SetWSURL(cfg.BaseWSRPC)
+bondingTracker.SetGEVM(gevm)
 
 	wg.Add(1)
 	go func() {
