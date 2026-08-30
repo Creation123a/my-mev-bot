@@ -666,7 +666,7 @@ liquidationTracker.SetWSURL(cfg.BaseWSRPC)
 	}()
 
 	// ---- Worker2 ----
-	for i := 0; i < numSimWorkers; i++ {
+	/*for i := 0; i < numSimWorkers; i++ {
 		wg.Add(1)
 		go func(workerID int) {
 			defer recoverPanic(fmt.Sprintf("Worker2-%d", workerID))
@@ -677,6 +677,7 @@ liquidationTracker.SetWSURL(cfg.BaseWSRPC)
 			worker2(ctx, candidateChan, executionChan, gevm, matrix, blacklist, anchorSet, cfg, sender)
 		}(i)
 	}
+	Only for bonding curve arb */
 
 	// ---- Worker3 ----
 	broadcastWg := &sync.WaitGroup{}
@@ -967,7 +968,9 @@ if matrix.IsReorg(swapLog.BlockNumber, blockHash) {
 			pool := matrix.GetPool(swapLog.Address)
 			if pool == nil {
 				// Unknown pool – offload to gatekeeper (non‑blocking)
-				gatekeeper.ProcessLog(swapLog)
+				/* Only for bonding curve arb
+				gatekeeper.ProcessLog(swapLog) */
+				
 				ingestion.PutSwapLog(swapLog)
 				continue
 			}
