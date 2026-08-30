@@ -381,24 +381,24 @@ if tokenAddr == (common.Address{}) {
 		return nil, false
 
 	case TopicThryx:
-		// AgentCurveUpdated(remainingTokens) – near zero
-		if len(vLog.Data) < 32 {
-			return nil, false
-		}
-		remaining := new(big.Int).SetBytes(vLog.Data[0:32])
-		// If remaining < 0.1% of typical allocation (1e21)
-		if remaining.Cmp(big.NewInt(1000000000000000000000)) < 0 {
-			return &BondingCandidate{
-				TokenAddress:    tokenAddr,
-				TargetContract:  cfg.TargetContract,
-				CurrentReserve:  remaining,
-				TargetThreshold: big.NewInt(0),
-				RequiredInput:   remaining,
-				Progress:        0.999,
-				LastUpdate:      time.Now(),
-				ReadyToGraduate: true,
-			}, true
-		}
+    if len(vLog.Data) < 32 {
+        return nil, false
+    }
+    remaining := new(big.Int).SetBytes(vLog.Data[0:32])
+    // 1e21 is too large for int64 – use SetString
+    threshold := new(big.Int).SetString("1000000000000000000000", 10)
+    if remaining.Cmp(threshold) < 0 {
+        return &BondingCandidate{
+            TokenAddress:    tokenAddr,
+            TargetContract:  cfg.TargetContract,
+            CurrentReserve:  remaining,
+            TargetThreshold: big.NewInt(0),
+            RequiredInput:   remaining,
+            Progress:        0.999,
+            LastUpdate:      time.Now(),
+            ReadyToGraduate: true,
+        }, true
+    }
 		return nil, false
 
 	default:
