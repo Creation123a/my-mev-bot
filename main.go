@@ -954,6 +954,7 @@ if matrix.IsReorg(swapLog.BlockNumber, blockHash) {
 			}
 
 			// ===== SHORT‑CIRCUIT =====
+			/*Only for bonding curve arb
 			if payload, matched := predictive.ShortCircuitEvaluate(swapLog.RawJSON); matched {
 				select {
 				case executionChan <- payload:
@@ -962,7 +963,7 @@ if matrix.IsReorg(swapLog.BlockNumber, blockHash) {
 				}
 				ingestion.PutSwapLog(swapLog)
 				continue
-			}
+			}*/
 
 			// ===== Normal processing =====
 			pool := matrix.GetPool(swapLog.Address)
