@@ -88,10 +88,9 @@ func StartWebSocketReader(
 	filter := map[string]interface{}{
 		"topics": topics,
 	}
+	// Only attach the address field if addresses actually exist
 	if len(validAddresses) > 0 {
 		filter["address"] = validAddresses
-	} else {
-		filter["address"] = []string{}
 	}
 
 	subReq := map[string]interface{}{
@@ -204,7 +203,7 @@ func StartWebSocketReader(
 			log.Printf("[WebSocket] Connection unstable; backing off %v", backoff)
 			time.Sleep(backoff)
 		} else {
-			backoff = 0
+			backoff = minBackoff
 		}
 		log.Println("[WebSocket] Connection closed. Reconnecting...")
 	}
@@ -212,6 +211,15 @@ func StartWebSocketReader(
 
 // readLoop reads messages from the WebSocket, extracts log data using jsonparser,
 // and sends parsed SwapLogs to the event channel.
+// BufferPool for reusing byte slices. Initial size = 64KB.
+var bufferPool = sync.Pool{
+	New: func() interface{} {
+		// Allocate a 64KB slice; this is the only allocation (once per buffer).
+		return make([]byte, 0, 65536)
+	},
+}
+
+// readLoop reads messages from the WebSocket with zero‑allocation for typical payloads.
 func readLoop(
 	ctx context.Context,
 	conn *websocket.Conn,
@@ -219,9 +227,6 @@ func readLoop(
 	decoder *Decoder,
 	writeMu *sync.Mutex,
 ) error {
-	// Buffers allocated once per loop to avoid allocations.
-	var readBuffer [65536]byte
-
 	for {
 		select {
 		case <-ctx.Done():
@@ -238,78 +243,103 @@ func readLoop(
 			return fmt.Errorf("next reader: %w", err)
 		}
 
-		// We only accept TextMessage (plain JSON). Skip binary messages.
 		if msgType != websocket.TextMessage {
-			// Drain and discard the message.
 			_, _ = io.Copy(io.Discard, reader)
 			continue
 		}
 
-		// Read the payload into the pre‑allocated buffer.
-		totalRead := 0
+		// ----- Get a buffer from the pool -----
+		buf := bufferPool.Get().([]byte)
+		// We'll use the slice's capacity, but we need to reset length to 0.
+		buf = buf[:0]
+
+		// ----- Read the entire message, growing buffer if needed -----
+		// This loop appends to the slice, which will allocate a new underlying array
+		// only when the capacity is exceeded. That allocation is rare.
+		// For the common case (small messages), no allocation occurs after the first use.
 		for {
-			n, err := reader.Read(readBuffer[totalRead:])
-			totalRead += n
+			// Read into the buffer.
+			n, err := reader.Read(buf[len(buf):cap(buf)])
+			if n > 0 {
+				buf = buf[:len(buf)+n]
+			}
 			if err == io.EOF {
 				break
 			}
 			if err != nil {
-				return err
+				bufferPool.Put(buf) // return buffer on error
+				return fmt.Errorf("read error: %w", err)
 			}
-			if totalRead >= len(readBuffer) {
-				// Payload too large; discard the rest.
-				log.Printf("[WebSocket] Payload exceeds buffer size; dropping message")
-				_, _ = io.Copy(io.Discard, reader)
-				totalRead = 0 // reset to avoid processing truncated data
-				break
+			// If we filled the entire capacity, grow the slice.
+			if len(buf) == cap(buf) {
+				// Double the capacity (similar to Go's slice growth).
+				newCap := cap(buf) * 2
+				if newCap == 0 {
+					newCap = 65536
+				}
+				// Create a new slice with double capacity and copy the old data.
+				newBuf := make([]byte, len(buf), newCap)
+				copy(newBuf, buf)
+				// Put the old buffer back to the pool (it will be reused later).
+				bufferPool.Put(buf)
+				buf = newBuf
+				// Continue reading into the new buffer.
+				continue
 			}
 		}
-		if totalRead == 0 {
+
+		// ----- Process the complete message -----
+		raw := buf // raw is the complete JSON message.
+
+		if len(raw) == 0 {
+			bufferPool.Put(buf)
 			continue
 		}
-		raw := readBuffer[:totalRead]
 
-		// Check if it's a subscription event (contains "method" and "subscription").
-		// We use bytes.Contains for a quick check before expensive jsonparser calls.
-		if !bytes.Contains(raw, []byte(`"method"`)) && !bytes.Contains(raw, []byte(`"subscription"`)) {
-			// Could be a subscription response or other message; ignore.
+		// Handle subscription confirmation response.
+		if bytes.Contains(raw, []byte(`"result"`)) && !bytes.Contains(raw, []byte(`"params"`)) {
+			log.Printf("[WebSocket] Received subscription confirmation ID: %s", string(raw))
+			bufferPool.Put(buf)
 			continue
 		}
 
-		// Extract the "params.result" object, which contains the log data.
+		// Extract log data using jsonparser (zero‑allocation parsing).
 		logData, dataType, _, err := jsonparser.Get(raw, "params", "result")
 		if err != nil {
-			// If not found, try "result" (for single responses)
 			logData, dataType, _, err = jsonparser.Get(raw, "result")
 			if err != nil || dataType != jsonparser.Object {
+				bufferPool.Put(buf)
 				continue
 			}
 		}
 		if dataType != jsonparser.Object || len(logData) < 10 {
+			bufferPool.Put(buf)
 			continue
 		}
 
-// Reuse a SwapLog from the pool.
-swapLog := GetSwapLog()
+		// Get a SwapLog from the pool and copy the logData.
+		swapLog := GetSwapLog()
+		// The logData slice points into the raw buffer. We must copy it before
+		// returning the buffer to the pool, otherwise the data will be overwritten.
+		swapLog.RawJSON = append(swapLog.RawJSON[:0], logData...)
 
-// Store a copy of the raw JSON for short‑circuit matching.
-// The append reuses the slice's capacity (zero‑allocation after first use).
-swapLog.RawJSON = append(swapLog.RawJSON[:0], logData...)
+		// Parse the log using the copied data (safe to use after buffer is returned).
+		if err := parseSwapLogZeroAlloc(swapLog.RawJSON, swapLog, decoder); err != nil {
+			PutSwapLog(swapLog)
+			bufferPool.Put(buf)
+			continue
+		}
 
-// Parse the log (pass the decoder).
-if err := parseSwapLogZeroAlloc(logData, swapLog, decoder); err != nil {
-    // If parsing fails, return the log to the pool and continue.
-    PutSwapLog(swapLog)
-    continue
-}
+		// Forward to event channel.
+		select {
+		case eventChan <- swapLog:
+		default:
+			PutSwapLog(swapLog)
+		}
 
-// Forward to event channel (non‑blocking to avoid head‑of‑line blocking).
-select {
-case eventChan <- swapLog:
-default:
-    PutSwapLog(swapLog)
-}
-}
+		// Return the buffer to the pool for reuse.
+		bufferPool.Put(buf)
+	}
 }
 // newLowLatencyDialer creates a WebSocket dialer with TCP_NODELAY and other low‑latency settings.
 func newLowLatencyDialer() websocket.Dialer {
@@ -334,7 +364,7 @@ func newLowLatencyDialer() websocket.Dialer {
 		NetDial:           netDialer.Dial,
 		ReadBufferSize:    socketReadBufferSize,
 		WriteBufferSize:   socketWriteBufferSize,
-		EnableCompression: false, // we don't use compression
+		EnableCompression: false,
 	}
 }
 
