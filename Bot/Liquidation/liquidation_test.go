@@ -45,6 +45,9 @@ func TestLiquidationPipeline(t *testing.T) {
 	cfg := &config.Config{LiquidationMinProfitUSD: 1.0}
 	liquidationExecutor := common.HexToAddress("0x7777777777777777777777777777777777777777")
 	tracker := NewTracker(nil, gevm, matrix, execChan, payloadPool, 1e9, cfg, 0.05)
+	// Add this line right after mockLog is defined to use the variable:
+tracker.handleLog(mockLog) 
+
 
 	// Pre‑store a user position (simulate what updatePosition would do)
 	tracker.knownUsers[userAddr] = struct{}{}
