@@ -7,16 +7,17 @@ import (
 	"testing"
 	"time"
 
-	"github.com"
-	"github.com/common"
-	gethTypes "github.com/core/types" // Aliased to fix type definition overrides
-	"github.com/crypto"
-	"github.com/ethclient/simulated"
+	"://github.com"
+	"://github.com/common"
+	gethTypes "://github.com/core/types"
+	"://github.com/crypto"
+	"://github.com/ethclient/simulated"
 
 	"my-mev-bot/Bot/Execution"
 	"my-mev-bot/Bot/State"
 	botTypes "my-mev-bot/Bot/Types"
 )
+
 
 func TestBondingGraduationPipeline(t *testing.T) {
 	matrix := state.NewMatrix()
