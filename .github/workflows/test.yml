@@ -27,7 +27,6 @@ jobs:
         cache: true
 
     - name: 🛠️ Install & Auto-Update Foundry Toolchain
-      # This step forces GitHub to check for and install the absolute newest nightly build
       uses: foundry-rs/foundry-toolchain@v1
       with:
         version: nightly
@@ -37,17 +36,18 @@ jobs:
         forge --version
         anvil --version
 
-        - name: 🌐 Boot Up Live Base Mainnet Fork Node
+    - name: 🌐 Boot Up Live Base Mainnet Fork Node
+      # Fixed YAML indentation format mismatch here
       run: anvil --fork-url https://alchemy.com --port 8545 &
       
     - name: 🧹 Sync Local Module Cache
-      # Removed GOSUMDB=off here so Go can securely verify the downloaded toolchain hashes!
+      # Removed GOSUMDB=off here so Go can securely verify toolchain signature hashes online
       run: |
         export GOPROXY=direct
         go mod tidy
 
     - name: ⚡ Run Entire Bot Orchestration Testing Engine
-      # Re-enable the direct overrides specifically for your custom bot package files
+      # Re-enabled checksum overrides exclusively to sandbox your proprietary local packages
       run: |
         export GOPROXY=direct
         export GOSUMDB=off
