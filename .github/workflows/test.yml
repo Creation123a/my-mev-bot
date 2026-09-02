@@ -37,19 +37,17 @@ jobs:
         forge --version
         anvil --version
 
-    - name: 🌐 Boot Up Live Base Mainnet Fork Node
-      # Spins up an in-memory background blockchain twin matching real-time market data
+        - name: 🌐 Boot Up Live Base Mainnet Fork Node
       run: anvil --fork-url https://alchemy.com --port 8545 &
       
     - name: 🧹 Sync Local Module Cache
-      # Configures dependencies locally, entirely bypassing public proxy network blocks
+      # Removed GOSUMDB=off here so Go can securely verify the downloaded toolchain hashes!
       run: |
         export GOPROXY=direct
-        export GOSUMDB=off
         go mod tidy
 
     - name: ⚡ Run Entire Bot Orchestration Testing Engine
-      # Fires your corrected strategy file packages simultaneously
+      # Re-enable the direct overrides specifically for your custom bot package files
       run: |
         export GOPROXY=direct
         export GOSUMDB=off
