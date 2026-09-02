@@ -1,0 +1,56 @@
+name: Auto-Updating MEV Pipeline Simulation
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch: # Allows you to trigger the test manually with 1-click on GitHub
+
+env:
+  FOUNDRY_PROFILE: ci
+
+jobs:
+  run-simulations:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: 📥 Check out repository code
+      uses: actions/checkout@v4
+      with:
+        submodules: recursive # Automatically pulls Uniswap/v4 hooks or submodules if present
+
+    - name: 🐹 Set up Go Compiler Environment
+      uses: actions/setup-go@v5
+      with:
+        go-version: '1.21'
+        cache: true
+
+    - name: 🛠️ Install & Auto-Update Foundry Toolchain
+      # This step forces GitHub to check for and install the absolute newest nightly build
+      uses: foundry-rs/foundry-toolchain@v1
+      with:
+        version: nightly
+
+    - name: 🔍 Display Latest Auto-Updated Framework Versions
+      run: |
+        forge --version
+        anvil --version
+
+    - name: 🌐 Boot Up Live Base Mainnet Fork Node
+      # Spins up an in-memory background blockchain twin matching real-time market data
+      run: anvil --fork-url https://alchemy.com --port 8545 &
+      
+    - name: 🧹 Sync Local Module Cache
+      # Configures dependencies locally, entirely bypassing public proxy network blocks
+      run: |
+        export GOPROXY=direct
+        export GOSUMDB=off
+        go mod tidy
+
+    - name: ⚡ Run Entire Bot Orchestration Testing Engine
+      # Fires your corrected strategy file packages simultaneously
+      run: |
+        export GOPROXY=direct
+        export GOSUMDB=off
+        go test -v ./Bot/Solver ./Bot/Bonding ./Bot/Liquidation
