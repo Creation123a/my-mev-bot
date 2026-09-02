@@ -7,17 +7,16 @@ import (
 	"testing"
 	"time"
 
-	"://github.com"
-	"://github.com/common"
-	gethTypes "://github.com/core/types"
-	"://github.com/crypto"
-	"://github.com/ethclient/simulated"
+	"github.com/ethereum/go-ethereum"
+	"github.com/ethereum/go-ethereum/common"
+	gethTypes "github.com/ethereum/go-ethereum/core/types"
+	"github.com/ethereum/go-ethereum/crypto"
+	"github.com/ethereum/go-ethereum/ethclient/simulated"
 
 	"my-mev-bot/Bot/Execution"
 	"my-mev-bot/Bot/State"
 	botTypes "my-mev-bot/Bot/Types"
 )
-
 
 func TestBondingGraduationPipeline(t *testing.T) {
 	matrix := state.NewMatrix()
