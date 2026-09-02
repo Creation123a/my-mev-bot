@@ -26,7 +26,7 @@ func TestDEXArbitragePipeline(t *testing.T) {
 	reserve0, _ := new(big.Int).SetString("100000000000000000000000", 10) // 100_000e18
 	reserve1, _ := new(big.Int).SetString("300000000000000", 10)         // 300_000_000e6
 
-	pool := &state.PoolState{ // Fixed type lookup context from state package
+	pool := &types.PoolState{ // Fixed type lookup context from state package
 		PoolAddress: common.HexToAddress("0x1234567890123456789012345678901234567890"),
 		Token0:      config.WETHAddress,
 		Token1:      config.USDCAddress,
@@ -37,7 +37,7 @@ func TestDEXArbitragePipeline(t *testing.T) {
 	matrix.RegisterPool(pool)
 
 	// 2. Synthetic SwapLog
-	log := &state.SwapLog{ // Fixed type lookup context from state package
+	log := &types.SwapLog{ // Fixed type lookup context from state package
 		Address:     pool.PoolAddress,
 		TokenIn:     config.WETHAddress,
 		TokenOut:    config.USDCAddress,
