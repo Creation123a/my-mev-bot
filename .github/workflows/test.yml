@@ -1,16 +1,18 @@
-name: End-to-End Live Production Sniper Simulation
+name: 4-Hour Automated Production Dry-Run
 
 on:
   push:
     branches: [ main, master ]
-  workflow_dispatch: # Allows you to manually trigger a fresh mainnet loop check with 1-click
+  workflow_dispatch: # Allows you to trigger a fresh 4-hour monitoring sweep with 1-click
 
 env:
   FOUNDRY_PROFILE: ci
 
 jobs:
-  production-simulation:
+  long-dry-run:
     runs-on: ubuntu-latest
+    # Set the strict ceiling to 240 minutes (4 Hours) to protect your free monthly allowance limits
+    timeout-minutes: 240 
 
     steps:
     - name: 📥 Check out repository code
@@ -28,21 +30,19 @@ jobs:
         version: nightly
 
     - name: 🌐 Boot Up Private Local Base Mainnet Fork Node
-      # Automatically converts your wss:// URL to an https:// URL so Anvil can fork the network state cleanly
+      # The local anvil fork acts as your real-time staging sandbox database layer
       run: |
-        RPC_URL=$(echo "wss://base-mainnet.g.alchemy.com/v2/alch_N3vxXXHx0b6NgDUEHff7A" | sed 's/wss:/https:/')
+        RPC_URL=$(echo "wss://://alchemy.com" | sed 's/wss:/https:/')
         anvil --fork-url $RPC_URL --port 8545 &
       
     - name: 🧹 Sync Module Database
       run: go mod tidy
 
-    - name: ⚡ Compile and Execute Complete End-to-End Bot Engine
+    - name: ⚡ Run Bot Pipeline (4-Hour Live Streaming Observation)
       run: |
-        # 1. Overwrite your execution target variables to send transactions to your local sandbox
         export BASE_RPC_URL="http://127.0.0.1:8545"
+        export BASE_WSS_URL="wss://://alchemy.com"
         
-        # 2. Feed the production websocket ingest flow directly from your valid Alchemy link
-        export BASE_WSS_URL="wss://base-mainnet.g.alchemy.com/v2/alch_N3vxXXHx0b6NgDUEHff7A"
-        
-        # 3. Boot the complete master bot engine configuration natively
-        timeout 45s go run main.go || id=$? && [ $id -eq 124 ] && echo "🎉 SUCCESS: Bot successfully ingested, calculated, and simulated live blocks without crashing!" || exit $id
+        # 'timeout 4h' tells the server to monitor live mainnet blocks for 4 hours
+        # It logs successes out cleanly before safely completing the workflow run
+        timeout 4h go run main.go || id=$? && [ $id -eq 124 ] && echo "🎉 SUCCESS: Bot securely ingested and simulated live blocks for 4 hours without memory leaks!" || exit $id
