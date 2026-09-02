@@ -24,32 +24,22 @@ jobs:
       uses: actions/setup-go@v5
       with:
         go-version: '1.22.0'
-        cache: false # Disabled cache to prevent old broken dependency hashes from locking the workspace
+        cache: false
 
     - name: 🛠️ Install & Auto-Update Foundry Toolchain
       uses: foundry-rs/foundry-toolchain@v1
       with:
         version: nightly
 
-    - name: 🔍 Display Latest Auto-Updated Framework Versions
-      run: |
-        forge --version
-        anvil --version
-
     - name: 🌐 Boot Up Live Base Mainnet Fork Node
       run: anvil --fork-url https://alchemy.com --port 8545 &
       
-    - name: 🧹 Sync Local Module Cache
-      # This configuration forces Go to run 100% locally and prevents 'git ls-remote' authorization failures
+    - name: 🧹 Securely Sync and Hash Module Cache
+      # Removed all proxy limits and force overrides so Go can build a perfect go.sum database natively
       run: |
-        export GOPROXY=direct
-        export GOSUMDB=off
-        export GIT_TERMINAL_PROMPT=0
-        go mod tidy || true # Force continue even if a private package throws a cosmetic warning
+        go mod tidy
 
     - name: ⚡ Run Entire Bot Orchestration Testing Engine
+      # Removed GOSUMDB=off entirely so your build runs cleanly without locking your local packages
       run: |
-        export GOPROXY=direct
-        export GOSUMDB=off
-        export GIT_TERMINAL_PROMPT=0
         go test -v ./Bot/Solver ./Bot/Bonding ./Bot/Liquidation
