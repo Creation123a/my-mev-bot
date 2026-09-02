@@ -20,7 +20,7 @@ import (
 
 func TestDEXArbitragePipeline(t *testing.T) {
 	// 1. Create a minimal matrix with one pool
-	matrix := state.NewMatrix()
+	matrix := State.NewMatrix()
 
 	// Parse big numbers using string representation to fix untyped float constant errors
 	reserve0, _ := new(big.Int).SetString("100000000000000000000000", 10) // 100_000e18
