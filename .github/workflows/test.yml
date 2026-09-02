@@ -29,7 +29,7 @@ jobs:
         version: nightly
 
     - name: 🌐 Boot Up Private Local Base Mainnet Fork Node
-      run: anvil --fork-url https://alchemy.com --port 8545 &
+      run: anvil --fork-url https://base-mainnet.g.alchemy.com/v2/alch_N3vxXXHx0b6NgDUEHff7A --port 8545 &
       
     - name: 🧹 Sync Module Database
       run: go mod tidy
