@@ -23,7 +23,7 @@ jobs:
     - name: 🐹 Set up Go Compiler Environment
       uses: actions/setup-go@v5
       with:
-        go-version: '1.21'
+        go-version: '1.22.0'
         cache: false # Disabled cache to prevent old broken dependency hashes from locking the workspace
 
     - name: 🛠️ Install & Auto-Update Foundry Toolchain
