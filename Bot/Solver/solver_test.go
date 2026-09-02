@@ -6,15 +6,16 @@ import (
 	"testing"
 	"time"
 
-	"github.com"
-	"github.com/common"
-	gethTypes "github.com/core/types" // Aliased to resolve type clashes
-	"github.com/crypto"
-	"github.com/ethclient/simulated"
+	"://github.com"
+	"://github.com/common"
+	gethTypes "://github.com/core/types"
+	"://github.com/crypto"
+	"://github.com/ethclient/simulated"
 
 	"my-mev-bot/Bot/Config"
 	"my-mev-bot/Bot/State"
 )
+
 
 func TestDEXArbitragePipeline(t *testing.T) {
 	// 1. Create a minimal matrix with one pool
