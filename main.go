@@ -835,11 +835,11 @@ func seedMatrixFromRecentBlocks(client *ethclient.Client, gk *gatekeeper.Gatekee
 		return
 	}
 	currentBlock := header.Number.Uint64()
-	if currentBlock < 20 {
-		log.Printf("[Bootstrap] Chain height < 20; skipping seed")
+	if currentBlock < 8 {
+		log.Printf("[Bootstrap] Chain height < 8; skipping seed")
 		return
 	}
-	fromBlock := currentBlock - 20
+	fromBlock := currentBlock - 8
 
 	v2Topic := common.HexToHash("0xd78ad95fa46c994b6551d0da85fc275fe613ce37657fb8d5e3d130840159d822")
 	v3Topic := common.HexToHash("0xc42079f94a6350d7e6235f29174924f928cc2ac818eb64fed8004e115fbcca67")
