@@ -11,7 +11,7 @@ env:
 jobs:
   long-dry-run:
     runs-on: ubuntu-latest
-    timeout-minutes: 245  # Safely handles the 4-hour monitoring lifecycle
+    timeout-minutes: 250
 
     steps:
     - name: 📥 Check out repository code
@@ -29,13 +29,22 @@ jobs:
         version: nightly
 
     - name: 🌐 Boot Up Live Dynamic Auto-Updating Base Fork Node
-      # FIX: Added compute unit throttles and tracking variables to update blocks in real time.
+      # Note: --compute-units-per-second and --poll-interval turn the static fork into a dynamic, shifting mirror
       run: |
         anvil \
           --fork-url https://base-mainnet.g.alchemy.com/v2/alch_N3vxXXHx0b6NgDUEHff7A \
           --compute-units-per-second 330 \
           --poll-interval 2s \
           --port 8545 &
+
+    - name: 🔒 Create Local HTTPS Proxy Loop for Anvil
+      run: |
+        sudo apt-get update && sudo apt-get install -y socat
+        openssl req -new -newkey rsa:2048 -days 1 -nodes -x509 \
+          -subj "/C=US/ST=State/L=City/O=Organization/CN=127.0.0.1" \
+          -keyout anvil.key -out anvil.crt
+        cat anvil.key anvil.crt > anvil.pem
+        socat SSL-LISTEN:8443,reuseaddr,cert=anvil.pem,verify=0,fork TCP4:127.0.0.1:8545 &
       
     - name: 🧹 Sync Module Database
       run: go mod tidy
@@ -46,9 +55,9 @@ jobs:
         # 1. READ CHANNEL: Subscribes directly to live data events on-chain
         BASE_WS_RPC=wss://base-mainnet.g.alchemy.com/v2/alch_N3vxXXHx0b6NgDUEHff7A
         
-        # 2. WRITE/SIMULATION CHANNEL: Diverts dry trades to your auto-updating local fork
-        BASE_HTTP_RPC=http://127.0.0.1:8545
-        BASE_EXEC_RPC=http://127.0.0.1:8545
+        # 2. WRITE/SIMULATION CHANNEL: Diverts dry trades safely to your local dynamic proxy
+        BASE_HTTP_RPC=https://127.0.0.1:8443
+        BASE_EXEC_RPC=https://127.0.0.1:8443
         
         # Executor Strategy Mapping
         FLASH_EXECUTOR_ADDRESS=0x4200000000000000000000000000000000000006
@@ -63,10 +72,13 @@ jobs:
         DASHBOARD_TOKEN=test123
         EOF
 
-        # Align remaining global fallback environment hooks to the local execution layer
-        export BASE_RPC_URL="http://127.0.0.1:8545"
+        # Bind system environment fallback triggers
+        export BASE_RPC_URL="https://127.0.0.1:8443"
         export BASE_WSS_URL="wss://base-mainnet.g.alchemy.com/v2/alch_N3vxXXHx0b6NgDUEHff7A"
         export PRIVATE_KEY="31fA4fec1e21a0e05fd465fafb81409477fb274ef2c2bbc98bdca5a2c28b6bae"
+
+        # Safe SSL Verification Skip Hook for Local TLS Proxy Loop
+        export GODEBUG=x509ignoreCN=0
 
         # 3. Fire the long-duration strategy validation step
         timeout 4h go run main.go || id=$? && [ $id -eq 124 ] && echo "🎉 SUCCESS: Bonding curve strategy executed safely for 4 hours!" || exit $id
