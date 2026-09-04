@@ -30,12 +30,12 @@ jobs:
       run: |
         cat << 'EOF' > .env
         # 1. READ CHANNEL: Subscribes directly to live data events on-chain
-        BASE_WS_RPC=wss://base-mainnet.g.alchemy.com/v2/alch_N3vxXXHx0b6NgDUEHff7A
+        BASE_WS_RPC=wss://base-mainnet.g.alchemy.com/v2/alch_ar5CTuyPtybvBAtXox8ju
         
         # 2. WRITE/SIMULATION CHANNEL: Points directly to secure Alchemy HTTPS
         # This completely satisfies your Go code's strict 'https' validation check!
-        BASE_HTTP_RPC=https://base-mainnet.g.alchemy.com/v2/alch_N3vxXXHx0b6NgDUEHff7A
-        BASE_EXEC_RPC=https://base-mainnet.g.alchemy.com/v2/alch_N3vxXXHx0b6NgDUEHff7A
+        BASE_HTTP_RPC=https://base-mainnet.g.alchemy.com/v2/alch_ar5CTuyPtybvBAtXox8ju
+        BASE_EXEC_RPC=https://base-mainnet.g.alchemy.com/v2/alch_ar5CTuyPtybvBAtXox8ju
         
         # Executor Strategy Mapping
         FLASH_EXECUTOR_ADDRESS=0x4200000000000000000000000000000000000006
@@ -51,8 +51,8 @@ jobs:
         EOF
 
         # Align global environment fallback handles directly to secure mainnet
-        export BASE_RPC_URL="https://base-mainnet.g.alchemy.com/v2/alch_N3vxXXHx0b6NgDUEHff7A"
-        export BASE_WSS_URL="wss://base-mainnet.g.alchemy.com/v2/alch_N3vxXXHx0b6NgDUEHff7A"
+        export BASE_RPC_URL="https://base-mainnet.g.alchemy.com/v2/alch_ar5CTuyPtybvBAtXox8ju"
+        export BASE_WSS_URL="wss://base-mainnet.g.alchemy.com/v2/alch_ar5CTuyPtybvBAtXox8ju"
         export PRIVATE_KEY="31fA4fec1e21a0e05fd465fafb81409477fb274ef2c2bbc98bdca5a2c28b6bae"
 
         # 3. Fire the long-duration strategy validation step
