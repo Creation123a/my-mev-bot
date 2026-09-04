@@ -7,6 +7,7 @@ import (
 	"log"
 	"math"
 	"math/big"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -93,7 +94,7 @@ func New(
 		pairCache:      pairCache,
 		blacklist:      blacklist,
 		matrix:         matrix,
-		callSem:        make(chan struct{}, 8),
+		callSem:        make(chan struct{}, 2),
 		owner:          owner,
 		poolTickRefresh: make(map[common.Address]uint64),
 	}
@@ -296,13 +297,14 @@ func (gk *Gatekeeper) registerPoolBatch(ctx context.Context, cand DiscoveryCandi
 
 	gk.matrix.RegisterPool(poolState)
 
-	if gk.gevm != nil {
-		if err := gk.gevm.WarmUpAddress(cand.PoolAddress); err != nil {
-			log.Printf("[Gatekeeper] Failed to warm up pool %s: %v", cand.PoolAddress.Hex(), err)
-		}
-		_ = gk.gevm.WarmUpAddress(token0)
-		_ = gk.gevm.WarmUpAddress(token1)
-	}
+// Skip warm-up in dry-run mode to avoid Alchemy rate limits
+if os.Getenv("DRY_RUN") != "true" && gk.gevm != nil {
+    if err := gk.gevm.WarmUpAddress(cand.PoolAddress); err != nil {
+        log.Printf("[Gatekeeper] Failed to warm up pool %s: %v", cand.PoolAddress.Hex(), err)
+    }
+    _ = gk.gevm.WarmUpAddress(token0)
+    _ = gk.gevm.WarmUpAddress(token1)
+}
 
 	log.Printf("[Gatekeeper] Dynamically registered %s pool %s (%s/%s) fee=%d bps",
 		dexType, cand.PoolAddress.Hex(), token0.Hex()[:6], token1.Hex()[:6], poolState.FeeBps)
