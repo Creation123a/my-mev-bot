@@ -21,7 +21,7 @@ jobs:
       uses: actions/setup-go@v5
       with:
         go-version: '1.22.0'
-      cache: false
+        cache: false # FIXED: Placed on its own line with correct indentation
 
     - name: 🧹 Sync Module Database
       run: go mod tidy
@@ -56,4 +56,4 @@ jobs:
         export PRIVATE_KEY="31fA4fec1e21a0e05fd465fafb81409477fb274ef2c2bbc98bdca5a2c28b6bae"
 
         # 3. Fire the long-duration strategy validation step
-        timeout 4h go run main.go|| id=$? && [ $id -eq 124 ] &&echo "🎉 SUCCESS: Bonding curve!" || exit $id
+        timeout 4h go run main.go || id=$? && [ $id -eq 124 ] && echo "🎉 SUCCESS: Bonding curve!" || exit $id
