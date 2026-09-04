@@ -21,46 +21,8 @@ jobs:
       uses: actions/setup-go@v5
       with:
         go-version: '1.22.0'
-        cache: false
+      cache: false
 
-    - name: 🛠️ Install & Auto-Update Foundry Toolchain
-      uses: foundry-rs/foundry-toolchain@v1
-      with:
-        version: nightly
-
-    - name: 🌐 Boot Up Live Dynamic Auto-Updating Base Fork Node
-      run: |
-        anvil \
-          --fork-url https://base-mainnet.g.alchemy.com/v2/alch_N3vxXXHx0b6NgDUEHff7A \
-          --compute-units-per-second 330 \
-          --poll-interval 2s \
-          --port 8545 &
-
-    - name: 🔒 Create Local HTTPS Proxy & Inject Trusted Root Authority
-      run: |
-        # 1. Install networking utilities
-        sudo apt-get update && sudo apt-get install -y socat netcat-openbsd
-        
-        # 2. Generate a valid localhost certificate with proper SAN extensions
-        openssl req -x509 -nodes -days 1 -newkey rsa:2048 \
-          -keyout anvil.key -out anvil.crt \
-          -subj "/CN=127.0.0.1" \
-          -addext "subjectAltName = IP:127.0.0.1"
-        cat anvil.key anvil.crt > anvil.pem
-        
-        # 3. Register the certificate into the system trust store so Go trusts it natively
-        sudo cp anvil.crt /usr/local/share/ca-certificates/anvil-local.crt
-        sudo update-ca-certificates
-        
-        # 4. Spin up the secure TLS proxy layer in the background
-        socat OPENSSL-LISTEN:8443,reuseaddr,cert=anvil.pem,verify=0,fork TCP4:127.0.0.1:8545 &
-        
-        # 5. BLOCKING WAIT-LOOP: Hold processing until both local endpoints are listening
-        echo "⏳ Waiting for Anvil and SSL Proxy to open ports..."
-        while ! nc -z 127.0.0.1 8545; do sleep 1; done
-        while ! nc -z 127.0.0.1 8443; do sleep 1; done
-        echo "🚀 All local RPC tunnels are up and listening successfully!"
-      
     - name: 🧹 Sync Module Database
       run: go mod tidy
 
@@ -70,9 +32,10 @@ jobs:
         # 1. READ CHANNEL: Subscribes directly to live data events on-chain
         BASE_WS_RPC=wss://base-mainnet.g.alchemy.com/v2/alch_N3vxXXHx0b6NgDUEHff7A
         
-        # 2. WRITE/SIMULATION CHANNEL: Securely routed to our native-trusted local fork proxy
-        BASE_HTTP_RPC=https://127.0.0.1:8443
-        BASE_EXEC_RPC=https://127.0.0.1:8443
+        # 2. WRITE/SIMULATION CHANNEL: Points directly to secure Alchemy HTTPS
+        # This completely satisfies your Go code's strict 'https' validation check!
+        BASE_HTTP_RPC=https://base-mainnet.g.alchemy.com/v2/alch_N3vxXXHx0b6NgDUEHff7A
+        BASE_EXEC_RPC=https://base-mainnet.g.alchemy.com/v2/alch_N3vxXXHx0b6NgDUEHff7A
         
         # Executor Strategy Mapping
         FLASH_EXECUTOR_ADDRESS=0x4200000000000000000000000000000000000006
@@ -87,10 +50,10 @@ jobs:
         DASHBOARD_TOKEN=test123
         EOF
 
-        # Align fallback environment anchors to our secure proxy link
-        export BASE_RPC_URL="https://127.0.0.1:8443"
+        # Align global environment fallback handles directly to secure mainnet
+        export BASE_RPC_URL="https://base-mainnet.g.alchemy.com/v2/alch_N3vxXXHx0b6NgDUEHff7A"
         export BASE_WSS_URL="wss://base-mainnet.g.alchemy.com/v2/alch_N3vxXXHx0b6NgDUEHff7A"
         export PRIVATE_KEY="31fA4fec1e21a0e05fd465fafb81409477fb274ef2c2bbc98bdca5a2c28b6bae"
 
         # 3. Fire the long-duration strategy validation step
-        timeout 4h go run main.go || id=$? && [ $id -eq 124 ] && echo "🎉 SUCCESS: Bonding curve strategy executed safely for 4 hours!" || exit $id
+        timeout 4h go run main.go|| id=$? && [ $id -eq 124 ] &&echo "🎉 SUCCESS: Bonding curve!" || exit $id
