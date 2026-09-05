@@ -175,7 +175,7 @@ if err := nonceTracker.SyncFromNode(ethClient, ownerAddress); err != nil {
 	defer cancel()
 // ---- Periodic nonce refresh ----
 go func() {
-    ticker := time.NewTicker(30 * time.Second)
+    ticker := time.NewTicker(5 * time.Second)
     defer ticker.Stop()
     for {
         select {
