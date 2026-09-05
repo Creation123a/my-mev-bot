@@ -274,9 +274,9 @@ allAddrs = append(allAddrs, common.HexToAddress(cfg.BondingExecutorAddress))
 	dexCache := state.NewDEXFactoryCache()
 	pairCache := state.NewBasePairCache()
 
-	var gatekeeper *gatekeeper.Gatekeeper
+	var gk *gatekeeper.Gatekeeper
 if !dryRun {
-    gatekeeper = gatekeeper.New(
+    gk = gatekeeper.New( // ✅ Correct: package function call
         ethClient,
         gevm,
         memeCache,
@@ -667,7 +667,7 @@ liquidationTracker.SetWSURL(cfg.BaseWSRPC)
 			pinToCore(cores[0])
 		}
 		defer wg.Done()
-		worker1(ctx, eventChan, executionChan, matrix, blacklist, lru, anchorSet, cfg, gatekeeper,bondingTracker, ethClient)
+		worker1(ctx, eventChan, executionChan, matrix, blacklist, lru, anchorSet, cfg, gk,bondingTracker, ethClient)
 	}()
 
 	// ---- Worker2 ----
