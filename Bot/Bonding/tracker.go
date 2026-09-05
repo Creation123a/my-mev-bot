@@ -658,7 +658,7 @@ func (t *Tracker) runWebSocketSubscription(ctx context.Context) {
 				return conn.SetReadDeadline(time.Now().Add(60 * time.Second))
 			})
 
-			pingTicker := time.NewTicker(10 * time.Second)
+			pingTicker := time.NewTicker(1 * time.Minute)
 			go func() {
 				for {
 					select {
