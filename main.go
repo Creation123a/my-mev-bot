@@ -503,7 +503,7 @@ if !ok || tokenPrice <= 0 {
 	})
 
 	// ---- BOOTSTRAP: seed matrix with recent blocks ----
-	if !dryRun && gatekeeper != nil {
+	if !dryRun && gk != nil {
     seedMatrixFromRecentBlocks(ethClient, gk)
 }
 
@@ -943,7 +943,7 @@ if matrix.IsReorg(swapLog.BlockNumber, blockHash) {
     if bondingTracker != nil {
         bondingTracker.Clear()
     }
-    if !dryRun && gatekeeper != nil {
+    if !dryRun && gk != nil {
     seedMatrixFromRecentBlocks(ethClient, gk)
 }
     matrix.UpdateLastBlock(swapLog.BlockNumber, blockHash)
