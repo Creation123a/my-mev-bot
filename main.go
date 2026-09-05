@@ -54,6 +54,7 @@ var (
 	lastLogMu    sync.Mutex
 	lastSwapLog  *types.SwapLog
 	activeTrades uint32 // used by memoryGuardian (kept for compatibility, but GC removed)
+	dryRun       bool
 )
 type blockInfo struct {
     Number uint64
