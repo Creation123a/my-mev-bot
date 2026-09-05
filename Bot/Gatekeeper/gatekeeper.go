@@ -104,7 +104,7 @@ func New(
 }
 // refreshV3TickDataLoop runs periodically to refresh V3 tick data for all pools.
 func (gk *Gatekeeper) refreshV3TickDataLoop(ctx context.Context) {
-    ticker := time.NewTicker(30 * time.Second)
+    ticker := time.NewTicker(10 * time.Minute)
     defer ticker.Stop()
 
     for {
