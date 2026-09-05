@@ -504,7 +504,7 @@ if !ok || tokenPrice <= 0 {
 
 	// ---- BOOTSTRAP: seed matrix with recent blocks ----
 	if !dryRun && gatekeeper != nil {
-    seedMatrixFromRecentBlocks(ethClient, gatekeeper)
+    seedMatrixFromRecentBlocks(ethClient, gk)
 }
 
 	// ---- Channels ----
@@ -944,7 +944,7 @@ if matrix.IsReorg(swapLog.BlockNumber, blockHash) {
         bondingTracker.Clear()
     }
     if !dryRun && gatekeeper != nil {
-    seedMatrixFromRecentBlocks(ethClient, gatekeeper)
+    seedMatrixFromRecentBlocks(ethClient, gk)
 }
     matrix.UpdateLastBlock(swapLog.BlockNumber, blockHash)
     ingestion.PutSwapLog(swapLog)
