@@ -834,7 +834,7 @@ type weightedPool struct {
 }
 
 // seedMatrixFromRecentBlocks (unchanged)
-func seedMatrixFromRecentBlocks(client *ethclient.Client, gk *gatekeeper.Gatekeeper) {
+func seedMatrixFromRecentBlocks(client *ethclient.Client, gk *gatekeeperpkg.Gatekeeper) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
