@@ -107,7 +107,7 @@ func pinToCore(core int) {
 }
 
 func main() {
-	dryRun := os.Getenv("DRY_RUN") == "true"
+	dryRun = os.Getenv("DRY_RUN") == "true"
 	// ===== 1. Set incremental GC (removes STW pauses) =====
 	debug.SetGCPercent(50)
 
