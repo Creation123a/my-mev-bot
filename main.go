@@ -106,6 +106,7 @@ func pinToCore(core int) {
 }
 
 func main() {
+	dryRun := os.Getenv("DRY_RUN") == "true"
 	// ===== 1. Set incremental GC (removes STW pauses) =====
 	debug.SetGCPercent(50)
 
@@ -273,16 +274,19 @@ allAddrs = append(allAddrs, common.HexToAddress(cfg.BondingExecutorAddress))
 	dexCache := state.NewDEXFactoryCache()
 	pairCache := state.NewBasePairCache()
 
-	gatekeeper := gatekeeper.New(
-		ethClient,
-		gevm,
-		memeCache,
-		dexCache,
-		pairCache,
-		blacklist,
-		matrix,
-		ownerAddress,
-	)
+	var gatekeeper *gatekeeper.Gatekeeper
+if !dryRun {
+    gatekeeper = gatekeeper.New(
+        ethClient,
+        gevm,
+        memeCache,
+        dexCache,
+        pairCache,
+        blacklist,
+        matrix,
+        ownerAddress,
+    )
+}
 
 	gevm.StartWebSocketContextUpdater(ctx)
 
@@ -498,7 +502,9 @@ if !ok || tokenPrice <= 0 {
 	})
 
 	// ---- BOOTSTRAP: seed matrix with recent blocks ----
-	seedMatrixFromRecentBlocks(ethClient, gatekeeper)
+	if !dryRun && gatekeeper != nil {
+    seedMatrixFromRecentBlocks(ethClient, gatekeeper)
+}
 
 	// ---- Channels ----
 	eventChan := make(chan *types.SwapLog, eventChanSize)
@@ -551,11 +557,13 @@ go func() {
 	statusChan := make(chan string, 1)
 
 	log.Println("[Main] Subscribing to ALL swap events (dynamic discovery enabled)")
-	decoder := ingestion.NewDecoder()
-	go func() {
-		defer recoverPanic("WebSocket reader")
-		ingestion.StartWebSocketReader(ctx, cfg.BaseWSRPC, eventChan, decoder, statusChan, nil)
-	}()
+	if !dryRun {
+    decoder := ingestion.NewDecoder()
+    go func() {
+        defer recoverPanic("WebSocket reader")
+        ingestion.StartWebSocketReader(ctx, cfg.BaseWSRPC, eventChan, decoder, statusChan, nil)
+    }()
+}
 
 	go func() {
 		defer recoverPanic("WebSocket status handler")
@@ -934,7 +942,9 @@ if matrix.IsReorg(swapLog.BlockNumber, blockHash) {
     if bondingTracker != nil {
         bondingTracker.Clear()
     }
+    if !dryRun && gatekeeper != nil {
     seedMatrixFromRecentBlocks(ethClient, gatekeeper)
+}
     matrix.UpdateLastBlock(swapLog.BlockNumber, blockHash)
     ingestion.PutSwapLog(swapLog)
     continue
