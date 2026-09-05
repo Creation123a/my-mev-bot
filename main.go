@@ -29,7 +29,7 @@ import (
 	"my-mev-bot/Bot/Config"
 	"my-mev-bot/Bot/Dashboard"
 	"my-mev-bot/Bot/Execution"
-	"my-mev-bot/Bot/Gatekeeper"
+	gatekeeperpkg "my-mev-bot/Bot/Gatekeeper"
 	"my-mev-bot/Bot/Ingestion"
 	"my-mev-bot/Bot/Predictive"
 	"my-mev-bot/Bot/Solver"
@@ -275,9 +275,9 @@ allAddrs = append(allAddrs, common.HexToAddress(cfg.BondingExecutorAddress))
 	dexCache := state.NewDEXFactoryCache()
 	pairCache := state.NewBasePairCache()
 
-	var gk *gatekeeper.Gatekeeper
+	var gk *gatekeeperpkg.Gatekeeper
 if !dryRun {
-    gk = gatekeeper.New( // ✅ Correct: package function call
+    gk = gatekeeperpkg.New(
         ethClient,
         gevm,
         memeCache,
@@ -899,7 +899,7 @@ func worker1(
 	lru *state.LRUCache,
 	anchorSet map[common.Address]bool,
 	cfg *config.Config,
-	gatekeeper *gatekeeper.Gatekeeper,
+	gatekeeper *gatekeeperpkg.Gatekeeper,
 	bondingTracker *bonding.Tracker,
 	ethClient *ethclient.Client,
 ) {
