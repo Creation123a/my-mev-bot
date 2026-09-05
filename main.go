@@ -943,8 +943,8 @@ if matrix.IsReorg(swapLog.BlockNumber, blockHash) {
     if bondingTracker != nil {
         bondingTracker.Clear()
     }
-    if !dryRun && gk != nil {
-    seedMatrixFromRecentBlocks(ethClient, gk)
+    if !dryRun && gatekeeper != nil {
+    seedMatrixFromRecentBlocks(ethClient, gatekeeper)
 }
     matrix.UpdateLastBlock(swapLog.BlockNumber, blockHash)
     ingestion.PutSwapLog(swapLog)
