@@ -27,32 +27,34 @@ jobs:
         run: go mod tidy
         
       - name: 📦 Install mock server dependencies
-        run: go get github.com/gorilla/websocket
+        run: go get ://github.com
 
-      # ---- Start the Mock MEV Simulator ----
-      - name: 🧪 Start Mock RPC/WebSocket Server
+      # ---- Start the Mock MEV Simulator natively over WSS ----
+      - name: 🧪 Start Native WSS Mock Server
         run: |
+          echo "🔑 Generating local SSL certificate..."
+          openssl req -x509 -newkey rsa:2048 -keyout key.pem -out cert.pem -days 1 -nodes -subj "/CN=localhost"
+
           echo "🔨 Pre-compiling the mock server..."
           go build -o mockserver cmd/mockserver/main.go
 
-          echo "🚀 Launching compiled mock server in background..."
+          echo "🚀 Launching Native WSS server in background..."
           ./mockserver > mockserver.log 2>&1 &
           
           echo "⏱️ Waiting for server to initialize..."
           SERVER_UP=false
-          # Loop up to 10 times checking every second to give it a solid buffer
           for i in {1..10}; do
+            # Note: Checking port 8546
             if nc -z 127.0.0.1 8546; then
-              echo "✅ Mock server online and listening on port 8546!"
+              echo "✅ Mock server online over TLS!"
               SERVER_UP=true
-              break  # <-- Cleanly breaks the loop instead of killing the process step
+              break
             fi
             sleep 1
           done
 
           if [ "$SERVER_UP" = false ]; then
-            echo "❌ CRITICAL: Mock server failed to start within 10 seconds."
-            echo "=== MOCK SERVER BUILD/RUN LOGS ==="
+            echo "❌ CRITICAL: Mock server failed to start."
             cat mockserver.log
             exit 1
           fi
@@ -61,14 +63,13 @@ jobs:
       - name: ⚙️ Configure Staging Environment
         run: |
           cat << 'EOF' > .env
-          # READ CHANNEL: Local WebSocket mock
-          BASE_WS_RPC=ws://localhost:8546/ws
+          # SUCCESS: Pure native wss endpoint on the same port!
+          BASE_WS_RPC=wss://localhost:8546/ws
 
-          # WRITE/SIMULATION CHANNEL: Local HTTP mock
-          BASE_HTTP_RPC=http://localhost:8546
-          BASE_EXEC_RPC=http://localhost:8546
+          # Using the TLS port for standard calls too
+          BASE_HTTP_RPC=https://localhost:8546
+          BASE_EXEC_RPC=https://localhost:8546
 
-          # Executor addresses (dummy, but your bot expects them)
           FLASH_EXECUTOR_ADDRESS=0x4200000000000000000000000000000000000006
           BONDING_EXECUTOR_ADDRESS=0x4200000000000000000000000000000000000006
           LIQUIDATION_EXECUTOR_ADDRESS=0x4200000000000000000000000000000000000006
@@ -77,29 +78,28 @@ jobs:
           MIN_PROFIT_USD=0.01
           LOAN_PROVIDER=BALANCER
           ENABLE_CPU_PINNING=false
-          DRY_RUN=true        # <-- Tells your bot to skip heavy historical scans
+          DRY_RUN=true
           DASHBOARD_TOKEN=test123
           EOF
 
-          # FIX: Write cross-step variables to GITHUB_ENV instead of using local exports
-          echo "BASE_RPC_URL=http://localhost:8546" >> $GITHUB_ENV
-          echo "BASE_WSS_URL=ws://localhost:8546/ws" >> $GITHUB_ENV
+          echo "BASE_RPC_URL=https://localhost:8546" >> $GITHUB_ENV
+          echo "BASE_WSS_URL=wss://localhost:8546/ws" >> $GITHUB_ENV
           echo "PRIVATE_KEY=31fA4fec1e21a0e05fd465fafb81409477fb274ef2c2bbc98bdca5a2c28b6bae" >> $GITHUB_ENV
+          
+          # Instruct Go client libraries to accept our local self-signed certificate
+          echo "GODEBUG=tlsinsecureclient=1" >> $GITHUB_ENV
 
       # ---- Run the Bot with 4‑Hour Monitoring ----
       - name: 🚀 Run 4‑Hour Stability & Retry Verification
         run: |
-          # Launch the bot
           go run main.go > bot_execution.log 2>&1 &
           BOT_PID=$!
 
-          echo "🔄 Soak test started. Monitoring for 4 hours (240 minutes)..."
+          echo "🔄 Soak test started. Monitoring for 4 hours..."
 
-          # 4 hours = 240 minutes, check every 60 seconds
           for minute in {1..240}; do
             sleep 60
 
-            # Check if bot crashed
             if ! kill -0 $BOT_PID 2>/dev/null; then
               echo "❌ Bot crashed at minute $minute!"
               echo "=== LAST 50 LINES OF BOT LOG ==="
@@ -107,14 +107,11 @@ jobs:
               exit 1
             fi
 
-            # Heartbeat for GitHub UI (prevents timeout)
             echo "⏱️ Heartbeat: $minute/240 minutes elapsed."
-
-            # Optional: count how many times competition triggered a retry
             RETRY_COUNT=$(grep -c "Frontrun" bot_execution.log || true)
             echo "🔄 Total simulated frontruns handled: $RETRY_COUNT"
           done
 
-          echo "✅ Bot passed the 4‑hour durability test without crashes!"
+          echo "✅ Bot passed the 4‑hour durability test!"
           kill $BOT_PID
           exit 0
