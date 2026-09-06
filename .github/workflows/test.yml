@@ -37,6 +37,12 @@ jobs:
             -subj "/CN=localhost" \
             -addext "subjectAltName = DNS:localhost, IP:127.0.0.1"
 
+          echo "🏛️ Installing self-signed certificate into Ubuntu system trust store..."
+          # Copy it to the CA certificates folder as a .crt file
+          sudo cp cert.pem /usr/local/share/ca-certificates/localhost-mock.crt
+          # Update the OS trust store
+          sudo update-ca-certificates
+
           echo "🔨 Pre-compiling the mock server..."
           go build -o mockserver cmd/mockserver/main.go
 
@@ -59,6 +65,7 @@ jobs:
             cat mockserver.log
             exit 1
           fi
+
 
 
       # ---- Configure .env to point to local mock server ----
