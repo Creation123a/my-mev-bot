@@ -27,7 +27,7 @@ jobs:
         run: go mod tidy
         
       - name: 📦 Install mock server dependencies
-        run: go get ://github.com
+        run: go get github.com/gorilla/websocket
 
       # ---- Start the Mock MEV Simulator natively over WSS ----
       - name: 🧪 Start Native WSS Mock Server
