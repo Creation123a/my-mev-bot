@@ -25,6 +25,9 @@ jobs:
 
       - name: 🧹 Sync Module Database
         run: go mod tidy
+        
+      - name: 📦 Install mock server dependencies
+        run: go get github.com/gorilla/websocket
 
       # ---- Start the Mock MEV Simulator ----
       - name: 🧪 Start Mock RPC/WebSocket Server
