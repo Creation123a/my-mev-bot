@@ -12,7 +12,9 @@ import (
 	"github.com/gorilla/websocket"
 )
 
-var upgrader = websocket.Upgrader{}
+var upgrader = websocket.Upgrader{
+	CheckOrigin: func(r *http.Request) bool { return true }, // Prevents local CORS connection drops
+}
 
 // ------------------------------
 // Global state (simulated blockchain)
@@ -68,7 +70,11 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 				reserve0 = 40_000 // Massive price imbalance
 			}
 
-			hexData := fmt.Sprintf("0x%064x%064x", reserve0, reserve1)
+			currentBlock := blockNum
+			r0, r1 := reserve0, reserve1
+			mu.Unlock()
+
+			hexData := fmt.Sprintf("0x%064x%064x", r0, r1)
 
 			payload := map[string]interface{}{
 				"jsonrpc": "2.0",
@@ -79,12 +85,11 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 						"address":         uniswapPool,
 						"topics":          []string{"0x1c9b1a533b99a3754884f18e1d2c9431e285d8869cc5a72049e7b2ff92e10c5a"}, // Sync event
 						"data":            hexData,
-						"blockNumber":     fmt.Sprintf("0x%x", blockNum),
-						"transactionHash": fmt.Sprintf("0xfakehash%x", blockNum),
+						"blockNumber":     fmt.Sprintf("0x%x", currentBlock),
+						"transactionHash": fmt.Sprintf("0xfakehash%x", currentBlock),
 					},
 				},
 			}
-			mu.Unlock()
 
 			bytes, _ := json.Marshal(payload)
 			if err := conn.WriteMessage(websocket.TextMessage, bytes); err != nil {
@@ -94,7 +99,7 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 		}
 	}()
 
-	// Thread 2: Handle incoming messages (eth_sendRawTransaction)
+	// Thread 2: Handle incoming messages (eth_sendRawTransaction, eth_subscribe)
 	for {
 		_, msgBytes, err := conn.ReadMessage()
 		if err != nil {
@@ -111,32 +116,32 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 		resp.ID = req.ID
 
 		switch req.Method {
+		case "eth_subscribe":
+			// Handshake method required by most high-performance client libraries
+			resp.Result = "0xsubfakeid12345"
+
 		case "eth_sendRawTransaction":
 			mu.Lock()
-			// 50% chance a competitor frontruns
 			competitorWon := rand.Float32() < 0.50
 			if competitorWon && blockNum%30 == 0 {
-				// Competitor rebalances pool first – arbitrage gone
 				reserve0 = 100_000
 				reserve1 = 300_000
 				resp.Error = map[string]interface{}{
 					"code":    -32000,
 					"message": "execution reverted: Slippage bounds exceeded (Frontrun)",
 				}
-				fmt.Println("⚔️ [MEV] Bot was frontrun! Forcing retry.")
+				fmt.Println("⚔️ [MEV] WS: Bot was frontrun! Forcing retry.")
 			} else {
 				nonce++
 				resp.Result = fmt.Sprintf("0xsuccessfulfake-txhash-%d", nonce)
-				fmt.Println("🏆 [SUCCESS] Bot transaction landed.")
+				fmt.Println("🏆 [SUCCESS] WS: Bot transaction landed.")
 			}
 			mu.Unlock()
 
 		case "eth_call":
-			// Simulate successful call by returning a dummy result
 			resp.Result = "0x0000000000000000000000000000000000000000000000000000000000000001"
 
 		case "eth_getTransactionReceipt":
-			// Return a dummy receipt
 			resp.Result = map[string]interface{}{
 				"transactionHash": "0xdeadbeef",
 				"blockNumber":     "0x1",
@@ -226,9 +231,7 @@ func httpHandler(w http.ResponseWriter, r *http.Request) {
 // Main
 // ------------------------------
 func main() {
-	// WebSocket endpoint
 	http.HandleFunc("/ws", wsHandler)
-	// HTTP endpoint (for eth_sendRawTransaction, eth_call, etc.)
 	http.HandleFunc("/", httpHandler)
 
 	fmt.Println("🧪 Mock MEV Simulator running on ws://localhost:8546/ws and http://localhost:8546")
