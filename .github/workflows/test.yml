@@ -29,7 +29,7 @@ jobs:
       - name: 📦 Install mock server dependencies
         run: go get github.com/gorilla/websocket
 
-           # ---- Start the Mock MEV Simulator ----
+      # ---- Start the Mock MEV Simulator ----
       - name: 🧪 Start Mock RPC/WebSocket Server
         run: |
           echo "🔨 Pre-compiling the mock server..."
@@ -39,20 +39,23 @@ jobs:
           ./mockserver > mockserver.log 2>&1 &
           
           echo "⏱️ Waiting for server to initialize..."
+          SERVER_UP=false
           # Loop up to 10 times checking every second to give it a solid buffer
           for i in {1..10}; do
             if nc -z 127.0.0.1 8546; then
               echo "✅ Mock server online and listening on port 8546!"
-              exit 0
+              SERVER_UP=true
+              break  # <-- Cleanly breaks the loop instead of killing the process step
             fi
             sleep 1
           done
 
-          echo "❌ CRITICAL: Mock server failed to start within 10 seconds."
-          echo "=== MOCK SERVER BUILD/RUN LOGS ==="
-          cat mockserver.log
-          exit 1
-
+          if [ "$SERVER_UP" = false ]; then
+            echo "❌ CRITICAL: Mock server failed to start within 10 seconds."
+            echo "=== MOCK SERVER BUILD/RUN LOGS ==="
+            cat mockserver.log
+            exit 1
+          fi
 
       # ---- Configure .env to point to local mock server ----
       - name: ⚙️ Configure Staging Environment
