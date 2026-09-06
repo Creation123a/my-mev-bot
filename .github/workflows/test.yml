@@ -32,8 +32,10 @@ jobs:
       # ---- Start the Mock MEV Simulator natively over WSS ----
       - name: 🧪 Start Native WSS Mock Server
         run: |
-          echo "🔑 Generating local SSL certificate..."
-          openssl req -x509 -newkey rsa:2048 -keyout key.pem -out cert.pem -days 1 -nodes -subj "/CN=localhost"
+          echo "🔑 Generating modern local SSL certificate with SAN..."
+          openssl req -x509 -newkey rsa:2048 -keyout key.pem -out cert.pem -days 1 -nodes \
+            -subj "/CN=localhost" \
+            -addext "subjectAltName = DNS:localhost, IP:127.0.0.1"
 
           echo "🔨 Pre-compiling the mock server..."
           go build -o mockserver cmd/mockserver/main.go
@@ -44,7 +46,6 @@ jobs:
           echo "⏱️ Waiting for server to initialize..."
           SERVER_UP=false
           for i in {1..10}; do
-            # Note: Checking port 8546
             if nc -z 127.0.0.1 8546; then
               echo "✅ Mock server online over TLS!"
               SERVER_UP=true
@@ -58,6 +59,7 @@ jobs:
             cat mockserver.log
             exit 1
           fi
+
 
       # ---- Configure .env to point to local mock server ----
       - name: ⚙️ Configure Staging Environment
