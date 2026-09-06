@@ -29,14 +29,30 @@ jobs:
       - name: 📦 Install mock server dependencies
         run: go get github.com/gorilla/websocket
 
-      # ---- Start the Mock MEV Simulator ----
+           # ---- Start the Mock MEV Simulator ----
       - name: 🧪 Start Mock RPC/WebSocket Server
         run: |
-          # Run the mock server in the background
-          go run cmd/mockserver/main.go > mockserver.log 2>&1 &
-          sleep 3
-          # Verify it's listening
-          nc -z localhost 8546 && echo "✅ Mock server online!" || exit 1
+          echo "🔨 Pre-compiling the mock server..."
+          go build -o mockserver cmd/mockserver/main.go
+
+          echo "🚀 Launching compiled mock server in background..."
+          ./mockserver > mockserver.log 2>&1 &
+          
+          echo "⏱️ Waiting for server to initialize..."
+          # Loop up to 10 times checking every second to give it a solid buffer
+          for i in {1..10}; do
+            if nc -z 127.0.0.1 8546; then
+              echo "✅ Mock server online and listening on port 8546!"
+              exit 0
+            fi
+            sleep 1
+          done
+
+          echo "❌ CRITICAL: Mock server failed to start within 10 seconds."
+          echo "=== MOCK SERVER BUILD/RUN LOGS ==="
+          cat mockserver.log
+          exit 1
+
 
       # ---- Configure .env to point to local mock server ----
       - name: ⚙️ Configure Staging Environment
@@ -62,10 +78,10 @@ jobs:
           DASHBOARD_TOKEN=test123
           EOF
 
-          # Override environment variables for the bot
-          export BASE_RPC_URL="http://localhost:8546"
-          export BASE_WSS_URL="ws://localhost:8546/ws"
-          export PRIVATE_KEY="31fA4fec1e21a0e05fd465fafb81409477fb274ef2c2bbc98bdca5a2c28b6bae"
+          # FIX: Write cross-step variables to GITHUB_ENV instead of using local exports
+          echo "BASE_RPC_URL=http://localhost:8546" >> $GITHUB_ENV
+          echo "BASE_WSS_URL=ws://localhost:8546/ws" >> $GITHUB_ENV
+          echo "PRIVATE_KEY=31fA4fec1e21a0e05fd465fafb81409477fb274ef2c2bbc98bdca5a2c28b6bae" >> $GITHUB_ENV
 
       # ---- Run the Bot with 4‑Hour Monitoring ----
       - name: 🚀 Run 4‑Hour Stability & Retry Verification
