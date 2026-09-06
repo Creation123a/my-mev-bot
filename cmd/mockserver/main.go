@@ -13,7 +13,7 @@ import (
 )
 
 var upgrader = websocket.Upgrader{
-	CheckOrigin: func(r *http.Request) bool { return true }, // Prevents local CORS connection drops
+	CheckOrigin: func(r *http.Request) bool { return true },
 }
 
 // ------------------------------
@@ -44,7 +44,7 @@ type RPCResponse struct {
 }
 
 // ------------------------------
-// WebSocket handler – streams logs & handles eth_sendRawTransaction
+// WebSocket handler – streams logs & handles incoming calls
 // ------------------------------
 func wsHandler(w http.ResponseWriter, r *http.Request) {
 	conn, err := upgrader.Upgrade(w, r, nil)
@@ -60,14 +60,11 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 		for {
 			mu.Lock()
 			blockNum++
-
-			// Natural market noise
 			reserve0 = uint64(100_000 + rand.Intn(2000))
 			reserve1 = uint64(300_000 + rand.Intn(6000))
 
-			// Inject arbitrage opportunity every 30 blocks
 			if blockNum%30 == 0 {
-				reserve0 = 40_000 // Massive price imbalance
+				reserve0 = 40_000 
 			}
 
 			currentBlock := blockNum
@@ -83,7 +80,7 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 					"subscription": "0xsubfakeid12345",
 					"result": map[string]interface{}{
 						"address":         uniswapPool,
-						"topics":          []string{"0x1c9b1a533b99a3754884f18e1d2c9431e285d8869cc5a72049e7b2ff92e10c5a"}, // Sync event
+						"topics":          []string{"0x1c9b1a533b99a3754884f18e1d2c9431e285d8869cc5a72049e7b2ff92e10c5a"}, 
 						"data":            hexData,
 						"blockNumber":     fmt.Sprintf("0x%x", currentBlock),
 						"transactionHash": fmt.Sprintf("0xfakehash%x", currentBlock),
@@ -95,11 +92,11 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 			if err := conn.WriteMessage(websocket.TextMessage, bytes); err != nil {
 				break
 			}
-			time.Sleep(2000 * time.Millisecond) // 2s block time
+			time.Sleep(2000 * time.Millisecond)
 		}
 	}()
 
-	// Thread 2: Handle incoming messages (eth_sendRawTransaction, eth_subscribe)
+	// Thread 2: Handle incoming messages
 	for {
 		_, msgBytes, err := conn.ReadMessage()
 		if err != nil {
@@ -117,8 +114,12 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 
 		switch req.Method {
 		case "eth_subscribe":
-			// Handshake method required by most high-performance client libraries
 			resp.Result = "0xsubfakeid12345"
+
+		case "eth_getTransactionCount":
+			mu.Lock()
+			resp.Result = fmt.Sprintf("0x%x", nonce)
+			mu.Unlock()
 
 		case "eth_sendRawTransaction":
 			mu.Lock()
@@ -150,7 +151,7 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 			}
 
 		case "eth_chainId":
-			resp.Result = "0x2105" // Base mainnet chain ID
+			resp.Result = "0x2105" 
 
 		default:
 			resp.Error = map[string]interface{}{
@@ -184,6 +185,11 @@ func httpHandler(w http.ResponseWriter, r *http.Request) {
 	resp.ID = req.ID
 
 	switch req.Method {
+	case "eth_getTransactionCount":
+		mu.Lock()
+		resp.Result = fmt.Sprintf("0x%x", nonce)
+		mu.Unlock()
+
 	case "eth_sendRawTransaction":
 		mu.Lock()
 		competitorWon := rand.Float32() < 0.50
@@ -226,7 +232,6 @@ func httpHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(resp)
 }
-
 // ------------------------------
 // Main
 // ------------------------------
