@@ -155,20 +155,24 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 			data := fmt.Sprintf("0x%s%s", padHex(virtualsCurrent), padHex(virtualsMaxSupply))
 			mu.Unlock()
 
-			payload := map[string]interface{}{
-				"jsonrpc": "2.0",
-				"method":  "eth_subscription",
-				"params": map[string]interface{}{
-					"subscription": "0xsubfakeid12345",
-					"result": map[string]interface{}{
-						"address":         virtualsFactory,
-						"topics":          []string{topicVirtuals},
-						"data":            data,
-						"blockNumber":     fmt.Sprintf("0x%x", currentBlock),
-						"transactionHash": fmt.Sprintf("0xfakehash%x", currentBlock),
-					},
-				},
-			}
+			// Real Virtuals tracking requires two topics: [0] signature, [1] indexed token address
+fakeTokenAddress := "0x000000000000000000000000000000000000babe"
+paddedTokenTopic := fmt.Sprintf("0x000000000000000000000000%s", fakeTokenAddress[2:])
+
+payload := map[string]interface{}{
+    "jsonrpc": "2.0",
+    "method":  "eth_subscription",
+    "params": map[string]interface{}{
+        "subscription": "0xsubfakeid12345",
+        "result": map[string]interface{}{
+            "address": virtualsFactory,
+            "topics":  []string{topicVirtuals, paddedTokenTopic}, // ✅ Now has 2 topics
+            "data":    data,
+            "blockNumber":     fmt.Sprintf("0x%x", currentBlock),
+            "transactionHash": fmt.Sprintf("0xfakehash%x", currentBlock),
+        },
+    },
+}
 
 			bytes, _ := json.Marshal(payload)
 			if err := conn.WriteMessage(websocket.TextMessage, bytes); err != nil {
