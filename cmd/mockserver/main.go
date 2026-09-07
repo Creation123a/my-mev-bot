@@ -45,12 +45,12 @@ type RPCResponse struct {
 	Error   interface{} `json:"error,omitempty"`
 }
 
-// ------------------------------
-// Helper: pad bytes to 64 hex chars (32 bytes)
-// ------------------------------
+// Helper: properly pads a big.Int to a 32-byte (64 character) hex string
 func padHex(b *big.Int) string {
-	hexStr := fmt.Sprintf("%064x", b)
-	return hexStr
+	// Extract the real base-16 hex string representation of the large number
+	rawHex := b.Text(16)
+	// Pad it out to exactly 64 characters to align perfectly with EVM logs
+	return fmt.Sprintf("%064s", rawHex)
 }
 
 // ------------------------------
