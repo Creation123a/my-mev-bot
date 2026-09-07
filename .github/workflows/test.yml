@@ -24,12 +24,14 @@ jobs:
           cache: false
 
       - name: 🧹 Sync Module Database
-        run: go mod tidy
+        run: |
+          go clean -cache -modcache
+          go mod tidy
         
       - name: 📦 Install mock server dependencies
-        run: go get github.com/gorilla/websocket
+        run: go get ://github.com
 
-      # ---- Start the Mock MEV Simulator natively over WSS ----
+      # ---- FIX: Generate Certs FIRST before compiling so the server picks them up natively ----
       - name: 🧪 Start Native WSS Mock Server
         run: |
           echo "🔑 Generating modern local SSL certificate with SAN..."
@@ -38,13 +40,11 @@ jobs:
             -addext "subjectAltName = DNS:localhost, IP:127.0.0.1"
 
           echo "🏛️ Installing self-signed certificate into Ubuntu system trust store..."
-          # Copy it to the CA certificates folder as a .crt file
           sudo cp cert.pem /usr/local/share/ca-certificates/localhost-mock.crt
-          # Update the OS trust store
           sudo update-ca-certificates
 
-          echo "🔨 Pre-compiling the mock server..."
-          go build -o mockserver cmd/mockserver/main.go
+          echo "🔨 Forcing clean pre-compilation of the TLS mock server..."
+          go build -a -o mockserver cmd/mockserver/main.go
 
           echo "🚀 Launching Native WSS server in background..."
           ./mockserver > mockserver.log 2>&1 &
@@ -66,16 +66,11 @@ jobs:
             exit 1
           fi
 
-
-
       # ---- Configure .env to point to local mock server ----
       - name: ⚙️ Configure Staging Environment
         run: |
           cat << 'EOF' > .env
-          # SUCCESS: Pure native wss endpoint on the same port!
           BASE_WS_RPC=wss://localhost:8546/ws
-
-          # Using the TLS port for standard calls too
           BASE_HTTP_RPC=https://localhost:8546
           BASE_EXEC_RPC=https://localhost:8546
 
@@ -94,8 +89,6 @@ jobs:
           echo "BASE_RPC_URL=https://localhost:8546" >> $GITHUB_ENV
           echo "BASE_WSS_URL=wss://localhost:8546/ws" >> $GITHUB_ENV
           echo "PRIVATE_KEY=31fA4fec1e21a0e05fd465fafb81409477fb274ef2c2bbc98bdca5a2c28b6bae" >> $GITHUB_ENV
-          
-          # Instruct Go client libraries to accept our local self-signed certificate
           echo "GODEBUG=tlsinsecureclient=1" >> $GITHUB_ENV
 
       # ---- Run the Bot with 4‑Hour Monitoring ----
