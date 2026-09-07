@@ -240,10 +240,18 @@ func httpHandler(w http.ResponseWriter, r *http.Request) {
 // Main
 // ------------------------------
 func main() {
-	rand.Seed(time.Now().UnixNano())
 	http.HandleFunc("/ws", wsHandler)
 	http.HandleFunc("/", httpHandler)
 
-	fmt.Println("🧪 Mock MEV Simulator (Virtuals Bonding) running on ws://localhost:8546/ws and http://localhost:8546")
-	http.ListenAndServe(":8546", nil)
+	// Explicitly search for certs in the root workspace folder where openssl saves them
+	certPath := "./cert.pem"
+	keyPath := "./key.pem"
+
+	fmt.Printf("🧪 Mock MEV Simulator initializing TLS with cert: %s, key: %s\n", certPath, keyPath)
+	
+	// Start serving strictly over HTTPS/WSS
+	err := http.ListenAndServeTLS(":8546", certPath, keyPath, nil)
+	if err != nil {
+		panic(fmt.Sprintf("❌ CRITICAL: TLS Server failed to boot: %v", err))
+	}
 }
