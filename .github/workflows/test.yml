@@ -31,7 +31,7 @@ jobs:
       - name: 📦 Install mock server dependencies
         run: go get github.com/gorilla/websocket
 
-      # ---- FIX: Generate Certs FIRST before compiling so the server picks them up natively ----
+      # ---- Start the Mock MEV Simulator natively over WSS ----
       - name: 🧪 Start Native WSS Mock Server
         run: |
           echo "🔑 Generating modern local SSL certificate with SAN..."
@@ -43,10 +43,11 @@ jobs:
           sudo cp cert.pem /usr/local/share/ca-certificates/localhost-mock.crt
           sudo update-ca-certificates
 
-          echo "🔨 Forcing clean pre-compilation of the TLS mock server..."
+          echo "🔨 Compiling the TLS mock server..."
           go build -a -o mockserver cmd/mockserver/main.go
 
           echo "🚀 Launching Native WSS server in background..."
+          # Running from root ensures ./cert.pem matches exactly where openssl dumped it
           ./mockserver > mockserver.log 2>&1 &
           
           echo "⏱️ Waiting for server to initialize..."
@@ -105,7 +106,9 @@ jobs:
             if ! kill -0 $BOT_PID 2>/dev/null; then
               echo "❌ Bot crashed at minute $minute!"
               echo "=== LAST 50 LINES OF BOT LOG ==="
-              tail -n 50 bot_execution.log
+              cat bot_execution.log | tail -n 50
+              echo "=== MOCK SERVER LOG STATUS ==="
+              cat mockserver.log | tail -n 20
               exit 1
             fi
 
