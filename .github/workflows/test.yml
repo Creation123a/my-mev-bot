@@ -21,11 +21,12 @@ jobs:
         uses: actions/setup-go@v5
         with:
           go-version: '1.22.0'
-          cache: false
+          cache: true # <-- FIX 1: Enable native caching to prevent redundant network fetches
 
       - name: 🧹 Sync Module Database
+        # FIX 2: Removed go clean -modcache to preserve cache layers. Added retry flags.
         run: |
-          go clean -cache -modcache
+          go env -w GOPROXY="https://proxy.golang.org,direct"
           go mod tidy
         
       - name: 📦 Install mock server dependencies
@@ -47,7 +48,6 @@ jobs:
           go build -a -o mockserver cmd/mockserver/main.go
 
           echo "🚀 Launching Native WSS server in background..."
-          # Running from root ensures ./cert.pem matches exactly where openssl dumped it
           ./mockserver > mockserver.log 2>&1 &
           
           echo "⏱️ Waiting for server to initialize..."
