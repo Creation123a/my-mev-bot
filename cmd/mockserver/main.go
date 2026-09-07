@@ -2,8 +2,10 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"math/big"
 	"math/rand"
 	"net/http"
@@ -13,7 +15,9 @@ import (
 	"github.com/gorilla/websocket"
 )
 
-var upgrader = websocket.Upgrader{}
+var upgrader = websocket.Upgrader{
+	CheckOrigin: func(r *http.Request) bool { return true },
+}
 
 // ------------------------------
 // Global simulated blockchain state
@@ -24,17 +28,18 @@ var (
 	nonce    = uint64(0)
 
 	// Virtuals bonding curve state
-	virtualsMaxSupply = new(big.Int).SetUint64(100_000_000_000_000_000) // 0.1 ether equivalent
-	virtualsCurrent   = new(big.Int).SetUint64(99_999_000_000_000_000)  // ~99.999%
+	virtualsMaxSupply = new(big.Int).SetUint64(100_000_000_000_000_000)
+	virtualsCurrent   = new(big.Int).SetUint64(99_999_000_000_000_000)
 )
 
 // ------------------------------
-// JSON-RPC structures
+// Robust JSON-RPC structures
 // ------------------------------
 type RPCRequest struct {
-	ID     interface{}     `json:"id"`
-	Method string          `json:"method"`
-	Params json.RawMessage `json:"params"`
+	Jsonrpc string          `json:"jsonrpc"`
+	ID      interface{}     `json:"id"` // Loose type to avoid unmarshaling errors
+	Method  string          `json:"method"`
+	Params  json.RawMessage `json:"params,omitempty"`
 }
 
 type RPCResponse struct {
@@ -46,172 +51,51 @@ type RPCResponse struct {
 
 // Helper: properly pads a big.Int to a 32-byte (64 character) hex string
 func padHex(b *big.Int) string {
-	// Extract the real base-16 hex string representation of the large number
 	rawHex := b.Text(16)
-	// Pad it out to exactly 64 characters to align perfectly with EVM logs
 	return fmt.Sprintf("%064s", rawHex)
 }
 
 // ------------------------------
-// WebSocket handler – streams bonding curve logs
+// Core JSON-RPC Router Engine
 // ------------------------------
-func wsHandler(w http.ResponseWriter, r *http.Request) {
-	conn, err := upgrader.Upgrade(w, r, nil)
-	if err != nil {
-		return
-	}
-	defer conn.Close()
-
-	// Real Virtuals factory address (must match tracker.go)
-	virtualsFactory := "0x1A540088125d00dD3990f9dA45CA0859af4d3B01"
-	topicVirtuals := "0x317cda4ec4ebf627725ca315c1e028b0811df5b7e289bf033878b2d1ca65a4a5"
-
-	// Thread: generate events every 2 seconds
-	go func() {
-		for {
-			mu.Lock()
-			blockNum++
-
-			// Every 20 blocks, create a graduation opportunity
-			if blockNum%20 == 0 {
-				// Set current supply to max - 1 wei (almost 100%)
-				virtualsCurrent.Sub(virtualsMaxSupply, big.NewInt(1))
-			} else {
-				// Random noise: current ~99.5% of max
-				noise := uint64(rand.Intn(500_000_000_000_000)) // up to 0.5%
-				virtualsCurrent = new(big.Int).Sub(virtualsMaxSupply, new(big.Int).SetUint64(noise))
-			}
-
-			// Build the StateUpdated event data: currentSupply, maxSupply
-			data := fmt.Sprintf("0x%s%s", padHex(virtualsCurrent), padHex(virtualsMaxSupply))
-
-			// Create the subscription payload
-			payload := map[string]interface{}{
-				"jsonrpc": "2.0",
-				"method":  "eth_subscription",
-				"params": map[string]interface{}{
-					"subscription": "0xsubfakeid12345",
-					"result": map[string]interface{}{
-						"address":         virtualsFactory,
-						"topics":          []string{topicVirtuals},
-						"data":            data,
-						"blockNumber":     fmt.Sprintf("0x%x", blockNum),
-						"transactionHash": fmt.Sprintf("0xfakehash%x", blockNum),
-					},
-				},
-			}
-			mu.Unlock()
-
-			bytes, _ := json.Marshal(payload)
-			if err := conn.WriteMessage(websocket.TextMessage, bytes); err != nil {
-				break
-			}
-			time.Sleep(2000 * time.Millisecond)
-		}
-	}()
-
-	// Thread: handle incoming messages (eth_sendRawTransaction)
-	for {
-		_, msgBytes, err := conn.ReadMessage()
-		if err != nil {
-			break
-		}
-
-		var req RPCRequest
-		if err := json.Unmarshal(msgBytes, &req); err != nil {
-			continue
-		}
-
-		var resp RPCResponse
-		resp.Jsonrpc = "2.0"
-		resp.ID = req.ID
-
-		switch req.Method {
-		case "eth_sendRawTransaction":
-			mu.Lock()
-			// 50% chance competitor frontruns
-			competitorWon := rand.Float32() < 0.50
-			// Only frontrun if there was an opportunity (block%20==0)
-			if competitorWon && blockNum%20 == 0 {
-				// Competitor rebalances the curve – no profit left
-				virtualsCurrent.Set(virtualsMaxSupply) // full supply
-				resp.Error = map[string]interface{}{
-					"code":    -32000,
-					"message": "execution reverted: Slippage bounds exceeded (Frontrun)",
-				}
-				fmt.Println("⚔️ [MEV] Bot was frontrun! Forcing retry.")
-			} else {
-				nonce++
-				resp.Result = fmt.Sprintf("0xsuccessfulfake-txhash-%d", nonce)
-				fmt.Println("🏆 [SUCCESS] Bot transaction landed.")
-			}
-			mu.Unlock()
-
-		case "eth_call":
-			// Dummy return for calls
-			resp.Result = "0x0000000000000000000000000000000000000000000000000000000000000001"
-
-		case "eth_getTransactionReceipt":
-			resp.Result = map[string]interface{}{
-				"transactionHash": "0xdeadbeef",
-				"blockNumber":     "0x1",
-				"status":          "0x1",
-				"logs":            []interface{}{},
-			}
-
-		case "eth_chainId":
-			resp.Result = "0x2105"
-
-		default:
-			resp.Error = map[string]interface{}{
-				"code":    -32601,
-				"message": "method not supported",
-			}
-		}
-
-		respBytes, _ := json.Marshal(resp)
-		_ = conn.WriteMessage(websocket.TextMessage, respBytes)
-	}
-}
-
-// ------------------------------
-// HTTP handler for RPC
-// ------------------------------
-func httpHandler(w http.ResponseWriter, r *http.Request) {
-	if r.Method != "POST" {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
-	var req RPCRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
-	}
-
+func processRPCMethod(req RPCRequest) RPCResponse {
 	var resp RPCResponse
 	resp.Jsonrpc = "2.0"
 	resp.ID = req.ID
 
+	// Fallback for null or empty IDs to keep clients happy
+	if resp.ID == nil {
+		resp.ID = 1
+	}
+
 	switch req.Method {
+	case "eth_subscribe":
+		resp.Result = "0xsubfakeid12345"
+
+	case "eth_getTransactionCount":
+		mu.Lock()
+		resp.Result = fmt.Sprintf("0x%x", nonce)
+		mu.Unlock()
+
 	case "eth_sendRawTransaction":
 		mu.Lock()
 		competitorWon := rand.Float32() < 0.50
 		if competitorWon && blockNum%20 == 0 {
-			virtualsCurrent.Set(virtualsMaxSupply)
+			virtualsCurrent.Set(virtualsMaxSupply) // Opportunity closed
 			resp.Error = map[string]interface{}{
 				"code":    -32000,
 				"message": "execution reverted: Slippage bounds exceeded (Frontrun)",
 			}
-			fmt.Println("⚔️ [MEV] HTTP: Bot was frontrun!")
+			fmt.Printf("⚔️ [MEV] Method [%s]: Bot frontrun attempt simulated.\n", req.Method)
 		} else {
 			nonce++
 			resp.Result = fmt.Sprintf("0xsuccessfulfake-txhash-%d", nonce)
-			fmt.Println("🏆 [SUCCESS] HTTP: Bot transaction landed.")
+			fmt.Printf("🏆 [SUCCESS] Method [%s]: Bot transaction simulated successfully.\n", req.Method)
 		}
 		mu.Unlock()
 
 	case "eth_call":
+		// Standard success code (1 wrapped in 32-byte padding)
 		resp.Result = "0x0000000000000000000000000000000000000000000000000000000000000001"
 
 	case "eth_getTransactionReceipt":
@@ -223,33 +107,151 @@ func httpHandler(w http.ResponseWriter, r *http.Request) {
 		}
 
 	case "eth_chainId":
-		resp.Result = "0x2105"
+		resp.Result = "0x2105" // Base Mainnet
+
+	case "eth_blockNumber":
+		mu.Lock()
+		resp.Result = fmt.Sprintf("0x%x", blockNum)
+		mu.Unlock()
+
+	case "eth_estimateGas":
+		resp.Result = "0x5208" // Standard 21000 gas units fallback
 
 	default:
-		resp.Error = map[string]interface{}{
-			"code":    -32601,
-			"message": "method not supported",
-		}
+		// Catch-all response to prevent initialization crashes for telemetry or tracking methods
+		resp.Result = "0x0"
+		fmt.Printf("ℹ️ [RPC] Handled unsupported method smoothly: %s\n", req.Method)
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(resp)
+	return resp
 }
 
 // ------------------------------
-// Main
+// WebSocket handler – streams logs & handles requests
 // ------------------------------
+func wsHandler(w http.ResponseWriter, r *http.Request) {
+	conn, err := upgrader.Upgrade(w, r, nil)
+	if err != nil {
+		return
+	}
+	defer conn.Close()
+
+	virtualsFactory := "0x1A540088125d00dD3990f9dA45CA0859af4d3B01"
+	topicVirtuals := "0x317cda4ec4ebf627725ca315c1e028b0811df5b7e289bf033878b2d1ca65a4a5"
+
+	// Thread 1: Continuous Event Stream Engine
+	go func() {
+		for {
+			mu.Lock()
+			blockNum++
+
+			if blockNum%20 == 0 {
+				virtualsCurrent.Sub(virtualsMaxSupply, big.NewInt(1)) // Graduation target
+			} else {
+				noise := uint64(rand.Intn(500_000_000_000_000))
+				virtualsCurrent = new(big.Int).Sub(virtualsMaxSupply, new(big.Int).SetUint64(noise))
+			}
+
+			currentBlock := blockNum
+			data := fmt.Sprintf("0x%s%s", padHex(virtualsCurrent), padHex(virtualsMaxSupply))
+			mu.Unlock()
+
+			payload := map[string]interface{}{
+				"jsonrpc": "2.0",
+				"method":  "eth_subscription",
+				"params": map[string]interface{}{
+					"subscription": "0xsubfakeid12345",
+					"result": map[string]interface{}{
+						"address":         virtualsFactory,
+						"topics":          []string{topicVirtuals},
+						"data":            data,
+						"blockNumber":     fmt.Sprintf("0x%x", currentBlock),
+						"transactionHash": fmt.Sprintf("0xfakehash%x", currentBlock),
+					},
+				},
+			}
+
+			bytes, _ := json.Marshal(payload)
+			if err := conn.WriteMessage(websocket.TextMessage, bytes); err != nil {
+				break
+			}
+			time.Sleep(2000 * time.Millisecond)
+		}
+	}()
+
+	// Thread 2: Incoming message handler
+	for {
+		_, msgBytes, err := conn.ReadMessage()
+		if err != nil {
+			break
+		}
+
+		var req RPCRequest
+		if err := json.Unmarshal(msgBytes, &req); err != nil {
+			continue
+		}
+
+		resp := processRPCMethod(req)
+		respBytes, _ := json.Marshal(resp)
+		_ = conn.WriteMessage(websocket.TextMessage, respBytes)
+	}
+}
+
+// ------------------------------
+// HTTP handler – supports batched and loose requests
+// ------------------------------
+func httpHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	bodyBytes, err := io.ReadAll(r.Body)
+	if err != nil {
+		http.Error(w, "Invalid body", http.StatusBadRequest)
+		return
+	}
+	defer r.Body.Close()
+
+	w.Header().Set("Content-Type", "application/json")
+
+	// Hardened check: Check if the incoming request is a batch array `[...]` or single object `{...}`
+	if len(bodyBytes) > 0 && bodyBytes[0] == '[' {
+		var reqs []RPCRequest
+		if err := json.Unmarshal(bodyBytes, &reqs); err != nil {
+			// Fallback placeholder error structure
+			json.NewEncoder(w).Encode(RPCResponse{Jsonrpc: "2.0", ID: 1, Result: "0x0"})
+			return
+		}
+
+		resps := make([]RPCResponse, len(reqs))
+		for i, req := range reqs {
+			resps[i] = processRPCMethod(req)
+		}
+		json.NewEncoder(w).Encode(resps)
+		return
+	}
+
+	// Single standard RPC Request path
+	var req RPCRequest
+	if err := json.Unmarshal(bodyBytes, &req); err != nil {
+		json.NewEncoder(w).Encode(RPCResponse{Jsonrpc: "2.0", ID: 1, Result: "0x0"})
+		return
+	}
+
+	resp := processRPCMethod(req)
+	json.NewEncoder(w).Encode(resp)
+}
+
 func main() {
+	rand.Seed(time.Now().UnixNano())
 	http.HandleFunc("/ws", wsHandler)
 	http.HandleFunc("/", httpHandler)
 
-	// Explicitly search for certs in the root workspace folder where openssl saves them
 	certPath := "./cert.pem"
 	keyPath := "./key.pem"
 
 	fmt.Printf("🧪 Mock MEV Simulator initializing TLS with cert: %s, key: %s\n", certPath, keyPath)
-	
-	// Start serving strictly over HTTPS/WSS
 	err := http.ListenAndServeTLS(":8546", certPath, keyPath, nil)
 	if err != nil {
 		panic(fmt.Sprintf("❌ CRITICAL: TLS Server failed to boot: %v", err))
