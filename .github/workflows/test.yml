@@ -38,7 +38,7 @@ jobs:
       - name: 🎥 Execute Live Alchemy Stream Recording
         env:
           # ⚠️ Replace with your actual Alchemy WSS URL or use a secret
-          ALCHEMY_WSS: ${{ secrets.ALCHEMY_WSS }}
+          ALCHEMY_WSS: ${{ wss://base-mainnet.g.alchemy.com/v2/alch_N3vxXXHx0b6NgDUEHff7A }}
         run: |
           if [ -z "$ALCHEMY_WSS" ]; then
             echo "❌ ALCHEMY_WSS secret not set. Please add it in GitHub Secrets."
