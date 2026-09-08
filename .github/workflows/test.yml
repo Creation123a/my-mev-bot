@@ -12,7 +12,7 @@ env:
 jobs:
   long-duration-soak-test:
     runs-on: ubuntu-latest
-    timeout-minutes: 250   # 4 hours + buffer
+    timeout-minutes: 50  # 4 hours + buffer
 
     steps:
       - name: 📥 Check out repository code
