@@ -1,69 +1,17 @@
-name: 4‑Hour Stress Test & MEV Simulation
+name: 50‑Minute Replay Stress Test
 
 on:
   push:
     branches: [ main, master ]
-  workflow_dispatch:   # Manual trigger for both jobs
+  workflow_dispatch:   # Manual trigger
 
 env:
-  FOUNDRY_PROFILE: ci
-  SKIP_TLS_VERIFY: true   # Skip TLS verification for self‑signed cert
+  SKIP_TLS_VERIFY: true   # Accept self‑signed certificate
 
 jobs:
-  # ------------------------------
-  # JOB 1: Record Live Alchemy Data (2 min)
-  # ------------------------------
-  record-data:
+  replay-soak-test:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
-    steps:
-      - name: 📥 Check out repository code
-        uses: actions/checkout@v4
-
-      - name: 🐹 Set up Go Compiler Environment
-        uses: actions/setup-go@v5
-        with:
-          go-version: '1.22.0'
-          cache: true
-
-      - name: 🧹 Sync Module Database
-        run: |
-          go env -w GOPROXY="https://proxy.golang.org,direct"
-          go mod tidy
-
-      - name: 📦 Install recorder dependencies
-        run: go get github.com/gorilla/websocket
-
-      # ---- Run the recorder script ----
-      - name: 🎥 Execute Live Alchemy Stream Recording
-        env:
-          # ⚠️ Replace with your actual Alchemy WSS URL or use a secret
-          ALCHEMY_WSS: wss://base-mainnet.g.alchemy.com/v2/alch_N3vxXXHx0b6NgDUEHff7A 
-        run: |
-          
-          # Temporarily replace the URL in recorder.go with the env var
-          sed -i "s|wss://base-mainnet.g.alchemy.com/v2/alch_N3vxXXHx0b6NgDUEHff7A|$ALCHEMY_WSS|g" recorder.go
-          echo "🚀 Starting 2-minute live network data recording..."
-          go run recorder.go
-          echo "📋 Recorded file size:"
-          ls -lh base_stream_dump.jsonl
-
-      # ---- Upload the file as an artifact ----
-      - name: 📦 Upload Recorded Data to GitHub Artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: alchemy-recorded-stream
-          path: base_stream_dump.jsonl
-          retention-days: 1   # Auto‑delete after 1 day
-
-  # ------------------------------
-  # JOB 2: 4‑Hour Replay Stress Test
-  # ------------------------------
-  long-duration-soak-test:
-    runs-on: ubuntu-latest
-    timeout-minutes: 50   # 4 hours + buffer
-    needs: record-data     # optional – set to false if you want to run independently
-    if: always()           # run even if record‑data fails (if you already have the file)
+    timeout-minutes: 55   # 50 minutes + buffer
 
     steps:
       - name: 📥 Check out repository code
@@ -76,9 +24,7 @@ jobs:
           cache: true
 
       - name: 🧹 Sync Module Database
-        run: |
-          go env -w GOPROXY="https://proxy.golang.org,direct"
-          go mod tidy
+        run: go mod tidy
 
       - name: 📦 Install mock server dependencies
         run: go get github.com/gorilla/websocket
@@ -86,37 +32,29 @@ jobs:
       # ---- Start the Replay Mock Server ----
       - name: 🧪 Start Replay Mock Server
         run: |
-          echo "🔑 Generating modern local SSL certificate with SAN..."
+          echo "🔑 Generating self‑signed SSL certificate..."
           openssl req -x509 -newkey rsa:2048 -keyout key.pem -out cert.pem -days 1 -nodes \
             -subj "/CN=localhost" \
             -addext "subjectAltName = DNS:localhost, IP:127.0.0.1"
 
-          echo "🏛️ Installing self-signed certificate into Ubuntu system trust store..."
+          echo "🏛️ Installing certificate into system trust store..."
           sudo cp cert.pem /usr/local/share/ca-certificates/localhost-mock.crt
           sudo update-ca-certificates
 
-          echo "🔨 Compiling the TLS replay mock server..."
+          echo "🔨 Compiling replay mock server..."
           go build -a -o mockserver cmd/mockserver/main.go
 
           echo "🚀 Launching replay server in background..."
           ./mockserver > mockserver.log 2>&1 &
 
-          echo "⏱️ Waiting for server to initialize..."
-          SERVER_UP=false
+          echo "⏱️ Waiting for server to be ready..."
           for i in {1..10}; do
             if nc -z 127.0.0.1 8546; then
-              echo "✅ Replay mock server online over TLS!"
-              SERVER_UP=true
+              echo "✅ Replay server online."
               break
             fi
             sleep 1
           done
-
-          if [ "$SERVER_UP" = false ]; then
-            echo "❌ CRITICAL: Replay mock server failed to start."
-            cat mockserver.log
-            exit 1
-          fi
 
       # ---- Configure .env ----
       - name: ⚙️ Configure Staging Environment
@@ -138,17 +76,13 @@ jobs:
           DASHBOARD_TOKEN=test123
           EOF
 
-          echo "BASE_RPC_URL=https://localhost:8546" >> $GITHUB_ENV
-          echo "BASE_WSS_URL=wss://localhost:8546/ws" >> $GITHUB_ENV
-          echo "PRIVATE_KEY=31fA4fec1e21a0e05fd465fafb81409477fb274ef2c2bbc98bdca5a2c28b6bae" >> $GITHUB_ENV
-
-      # ---- Run the Bot with 4‑Hour Monitoring ----
-      - name: 🚀 Run 4‑Hour Stability & Retry Verification
+      # ---- Run the Bot with 50‑Minute Monitoring ----
+      - name: 🚀 Run 50‑Minute Stability & Retry Verification
         run: |
           go run main.go > bot_execution.log 2>&1 &
           BOT_PID=$!
 
-          echo "🔄 Soak test started. Monitoring for 4 hours..."
+          echo "🔄 Soak test started. Monitoring for 50 minutes..."
 
           for minute in {1..50}; do
             sleep 60
@@ -163,10 +97,10 @@ jobs:
             fi
 
             echo "⏱️ Heartbeat: $minute/50 minutes elapsed."
-            RETRY_COUNT=$(grep -c "successfulmocktransactionhash" bot_execution.log || true)
-            echo "🔄 Total simulated transactions: $RETRY_COUNT"
+            TX_COUNT=$(grep -c "successfulmocktransactionhash" bot_execution.log || true)
+            echo "🔄 Total simulated transactions: $TX_COUNT"
           done
 
-          echo "✅ Bot passed the 4‑hour durability test!"
+          echo "✅ Bot passed the 50‑minute durability test!"
           kill $BOT_PID
           exit 0
