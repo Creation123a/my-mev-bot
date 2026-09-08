@@ -7,6 +7,7 @@ on:
 
 env:
   FOUNDRY_PROFILE: ci
+  SKIP_TLS_VERIFY: true   # <-- IMPORTANT: skip TLS verification for self‑signed cert
 
 jobs:
   long-duration-soak-test:
@@ -21,19 +22,18 @@ jobs:
         uses: actions/setup-go@v5
         with:
           go-version: '1.22.0'
-          cache: true # <-- FIX 1: Enable native caching to prevent redundant network fetches
+          cache: true
 
       - name: 🧹 Sync Module Database
-        # FIX 2: Removed go clean -modcache to preserve cache layers. Added retry flags.
         run: |
           go env -w GOPROXY="https://proxy.golang.org,direct"
           go mod tidy
-        
+
       - name: 📦 Install mock server dependencies
         run: go get github.com/gorilla/websocket
 
-      # ---- Start the Mock MEV Simulator natively over WSS ----
-      - name: 🧪 Start Native WSS Mock Server
+      # ---- Start the Replay Mock Server over WSS ----
+      - name: 🧪 Start Replay Mock Server
         run: |
           echo "🔑 Generating modern local SSL certificate with SAN..."
           openssl req -x509 -newkey rsa:2048 -keyout key.pem -out cert.pem -days 1 -nodes \
@@ -44,17 +44,17 @@ jobs:
           sudo cp cert.pem /usr/local/share/ca-certificates/localhost-mock.crt
           sudo update-ca-certificates
 
-          echo "🔨 Compiling the TLS mock server..."
+          echo "🔨 Compiling the TLS replay mock server..."
           go build -a -o mockserver cmd/mockserver/main.go
 
-          echo "🚀 Launching Native WSS server in background..."
+          echo "🚀 Launching replay server in background..."
           ./mockserver > mockserver.log 2>&1 &
-          
+
           echo "⏱️ Waiting for server to initialize..."
           SERVER_UP=false
           for i in {1..10}; do
             if nc -z 127.0.0.1 8546; then
-              echo "✅ Mock server online over TLS!"
+              echo "✅ Replay mock server online over TLS!"
               SERVER_UP=true
               break
             fi
@@ -62,7 +62,7 @@ jobs:
           done
 
           if [ "$SERVER_UP" = false ]; then
-            echo "❌ CRITICAL: Mock server failed to start."
+            echo "❌ CRITICAL: Replay mock server failed to start."
             cat mockserver.log
             exit 1
           fi
@@ -90,7 +90,7 @@ jobs:
           echo "BASE_RPC_URL=https://localhost:8546" >> $GITHUB_ENV
           echo "BASE_WSS_URL=wss://localhost:8546/ws" >> $GITHUB_ENV
           echo "PRIVATE_KEY=31fA4fec1e21a0e05fd465fafb81409477fb274ef2c2bbc98bdca5a2c28b6bae" >> $GITHUB_ENV
-          echo "GODEBUG=tlsinsecureclient=1" >> $GITHUB_ENV
+          # Remove the ineffective GODEBUG line – SKIP_TLS_VERIFY is set globally
 
       # ---- Run the Bot with 4‑Hour Monitoring ----
       - name: 🚀 Run 4‑Hour Stability & Retry Verification
@@ -113,8 +113,8 @@ jobs:
             fi
 
             echo "⏱️ Heartbeat: $minute/240 minutes elapsed."
-            RETRY_COUNT=$(grep -c "Frontrun" bot_execution.log || true)
-            echo "🔄 Total simulated frontruns handled: $RETRY_COUNT"
+            RETRY_COUNT=$(grep -c "successfulmocktransactionhash" bot_execution.log || true)
+            echo "🔄 Total simulated transactions: $RETRY_COUNT"
           done
 
           echo "✅ Bot passed the 4‑hour durability test!"
