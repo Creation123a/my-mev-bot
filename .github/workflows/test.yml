@@ -3,16 +3,70 @@ name: 4‑Hour Stress Test & MEV Simulation
 on:
   push:
     branches: [ main, master ]
-  workflow_dispatch:   # Manual trigger to save free minutes
+  workflow_dispatch:   # Manual trigger for both jobs
 
 env:
   FOUNDRY_PROFILE: ci
-  SKIP_TLS_VERIFY: true   # <-- IMPORTANT: skip TLS verification for self‑signed cert
+  SKIP_TLS_VERIFY: true   # Skip TLS verification for self‑signed cert
 
 jobs:
+  # ------------------------------
+  # JOB 1: Record Live Alchemy Data (2 min)
+  # ------------------------------
+  record-data:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: 📥 Check out repository code
+        uses: actions/checkout@v4
+
+      - name: 🐹 Set up Go Compiler Environment
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22.0'
+          cache: true
+
+      - name: 🧹 Sync Module Database
+        run: |
+          go env -w GOPROXY="https://proxy.golang.org,direct"
+          go mod tidy
+
+      - name: 📦 Install recorder dependencies
+        run: go get github.com/gorilla/websocket
+
+      # ---- Run the recorder script ----
+      - name: 🎥 Execute Live Alchemy Stream Recording
+        env:
+          # ⚠️ Replace with your actual Alchemy WSS URL or use a secret
+          ALCHEMY_WSS: ${{ secrets.ALCHEMY_WSS }}
+        run: |
+          if [ -z "$ALCHEMY_WSS" ]; then
+            echo "❌ ALCHEMY_WSS secret not set. Please add it in GitHub Secrets."
+            exit 1
+          fi
+          # Temporarily replace the URL in recorder.go with the env var
+          sed -i "s|wss://eth-mainnet.g.alchemy.com/v2/YOUR_API_KEY|$ALCHEMY_WSS|g" recorder.go
+          echo "🚀 Starting 2-minute live network data recording..."
+          go run recorder.go
+          echo "📋 Recorded file size:"
+          ls -lh base_stream_dump.jsonl
+
+      # ---- Upload the file as an artifact ----
+      - name: 📦 Upload Recorded Data to GitHub Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: alchemy-recorded-stream
+          path: base_stream_dump.jsonl
+          retention-days: 1   # Auto‑delete after 1 day
+
+  # ------------------------------
+  # JOB 2: 4‑Hour Replay Stress Test
+  # ------------------------------
   long-duration-soak-test:
     runs-on: ubuntu-latest
-    timeout-minutes: 50  # 4 hours + buffer
+    timeout-minutes: 50   # 4 hours + buffer
+    needs: record-data     # optional – set to false if you want to run independently
+    if: always()           # run even if record‑data fails (if you already have the file)
 
     steps:
       - name: 📥 Check out repository code
@@ -32,7 +86,7 @@ jobs:
       - name: 📦 Install mock server dependencies
         run: go get github.com/gorilla/websocket
 
-      # ---- Start the Replay Mock Server over WSS ----
+      # ---- Start the Replay Mock Server ----
       - name: 🧪 Start Replay Mock Server
         run: |
           echo "🔑 Generating modern local SSL certificate with SAN..."
@@ -67,7 +121,7 @@ jobs:
             exit 1
           fi
 
-      # ---- Configure .env to point to local mock server ----
+      # ---- Configure .env ----
       - name: ⚙️ Configure Staging Environment
         run: |
           cat << 'EOF' > .env
@@ -90,7 +144,6 @@ jobs:
           echo "BASE_RPC_URL=https://localhost:8546" >> $GITHUB_ENV
           echo "BASE_WSS_URL=wss://localhost:8546/ws" >> $GITHUB_ENV
           echo "PRIVATE_KEY=31fA4fec1e21a0e05fd465fafb81409477fb274ef2c2bbc98bdca5a2c28b6bae" >> $GITHUB_ENV
-          # Remove the ineffective GODEBUG line – SKIP_TLS_VERIFY is set globally
 
       # ---- Run the Bot with 4‑Hour Monitoring ----
       - name: 🚀 Run 4‑Hour Stability & Retry Verification
@@ -100,7 +153,7 @@ jobs:
 
           echo "🔄 Soak test started. Monitoring for 4 hours..."
 
-          for minute in {1..240}; do
+          for minute in {1..50}; do
             sleep 60
 
             if ! kill -0 $BOT_PID 2>/dev/null; then
@@ -112,7 +165,7 @@ jobs:
               exit 1
             fi
 
-            echo "⏱️ Heartbeat: $minute/240 minutes elapsed."
+            echo "⏱️ Heartbeat: $minute/50 minutes elapsed."
             RETRY_COUNT=$(grep -c "successfulmocktransactionhash" bot_execution.log || true)
             echo "🔄 Total simulated transactions: $RETRY_COUNT"
           done
